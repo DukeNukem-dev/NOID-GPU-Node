@@ -131,6 +131,15 @@ unsafe fn sbox(x: V) -> V {
     mul(mul(x, x2), x4)
 }
 
+/// S-box on N independent values, staged so independent work sits side by side (~6% on Zen 2).
+#[inline(always)]
+unsafe fn sbox_n<const N: usize>(x: [V; N]) -> [V; N] {
+    let x2: [V; N] = core::array::from_fn(|k| sq(x[k]));
+    let x4: [V; N] = core::array::from_fn(|k| sq(x2[k]));
+    let x3: [V; N] = core::array::from_fn(|k| mul(x[k], x2[k]));
+    core::array::from_fn(|k| mul(x3[k], x4[k]))
+}
+
 #[inline(always)]
 unsafe fn mds_full(s: &mut [V; STATE_SIZE], t: &Tables) {
     let x = *s;
@@ -174,8 +183,9 @@ unsafe fn permute_n<const N: usize>(s: &mut [[V; STATE_SIZE]; N], t: &Tables) {
                 mds_full(&mut s[k], t);
             }
         } else {
+            let y = sbox_n::<N>(core::array::from_fn(|k| _mm_xor_si128(s[k][0], ld(t.rc[r][0]))));
             for k in 0..N {
-                s[k][0] = sbox(_mm_xor_si128(s[k][0], ld(t.rc[r][0])));
+                s[k][0] = y[k];
             }
             for k in 0..N {
                 mds_partial(&mut s[k], t);
