@@ -191,6 +191,22 @@ impl Drop for PinGateGuard {
 /// transcript or primitive parameter: it only turns each native rejection
 /// equation `e = 0` into `gate * e = 0`.  Callers must separately constrain
 /// `gate` to a boolean and bind the complementary base relation.
+/// amun: run `f` with an empty pin-gate stack on this thread, restoring the previous stack afterwards
+/// (a forked assembly section may be stolen by a rayon worker that is inside another section's gate scope).
+pub(crate) fn with_clean_pin_gates<R>(f: impl FnOnce() -> R) -> R {
+    let saved = PIN_GATES.with(|gates| std::mem::take(&mut *gates.borrow_mut()));
+    struct Restore(Option<Vec<LinExpr>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(saved) = self.0.take() {
+                PIN_GATES.with(|gates| *gates.borrow_mut() = saved);
+            }
+        }
+    }
+    let _restore = Restore(Some(saved));
+    f()
+}
+
 pub(crate) fn with_pin_gate<R>(gate: &LinExpr, f: impl FnOnce() -> R) -> R {
     PIN_GATES.with(|gates| gates.borrow_mut().push(gate.clone()));
     let _guard = PinGateGuard;

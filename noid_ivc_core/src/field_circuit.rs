@@ -376,6 +376,10 @@ pub struct FieldR1csBuilder {
     checked_boolean_gates: std::collections::HashSet<SymbolicProductOperand>,
     checked_boolean_gate_bytes: usize,
     boolean_pin_stats: BooleanPinObservation,
+    /// amun: for a witness fork, the parent's wire count when the fork was taken (0 = not a fork),
+    /// and the parent's pending deferred-witness count at that time.
+    amun_fork_base: usize,
+    amun_fork_pending0: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -471,13 +475,14 @@ impl SymbolicProductObserver {
     }
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct TowerBitKey {
     width: usize,
     constant: u128,
     terms: Vec<(u32, u128)>,
 }
 
+#[derive(Clone)]
 struct DeferredConstraintPatch {
     wire: u32,
     a_start: usize,
@@ -527,6 +532,8 @@ impl FieldR1csBuilder {
             checked_boolean_gates: std::collections::HashSet::new(),
             checked_boolean_gate_bytes: 0,
             boolean_pin_stats: BooleanPinObservation::default(),
+            amun_fork_base: 0,
+            amun_fork_pending0: 0,
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
         let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
@@ -832,6 +839,95 @@ impl FieldR1csBuilder {
 
     pub fn num_wires(&self) -> usize {
         self.values.len()
+    }
+
+    /// amun: a witness-only sub-builder whose next wire is `start` (>= `num_wires()`). It sees this builder's
+    /// values and tower-bit cache; wires between `num_wires()` and `start` read as zero (callers must not use
+    /// them). Only for witness-only builders without the cross-section caches (product aliases, reused linear
+    /// rows, fused boolean pins, product observer), where wire allocation depends only on the section itself.
+    pub fn amun_fork_witness_at(&self, start: usize) -> Result<Self, &'static str> {
+        if self.record_rows {
+            return Err("fork needs a witness-only builder");
+        }
+        if self.symbolic_product_aliases || self.reuse_linear_rows || self.fused_boolean_pins || self.product_observer.is_some() {
+            return Err("fork needs the cross-section caches off");
+        }
+        if start < self.values.len() {
+            return Err("fork start below the current wire count");
+        }
+        let mut values = self.values.clone();
+        values.resize(start, F128::ZERO);
+        let mut deferred = self.deferred_witness_slots.clone();
+        deferred.resize(start, 0);
+        Ok(Self {
+            values,
+            a_cols: Vec::new(),
+            a_value_indices: Vec::new(),
+            a_offsets: self.a_offsets.clone(),
+            b_cols: Vec::new(),
+            b_value_indices: Vec::new(),
+            b_offsets: self.b_offsets.clone(),
+            value_table: Vec::new(),
+            value_map: std::collections::HashMap::new(),
+            publics: Vec::new(),
+            record_rows: false,
+            builder_brand: self.builder_brand,
+            deferred_witness_slots: deferred,
+            pending_deferred_witness_slots: self.pending_deferred_witness_slots,
+            pending_deferred_constraint_slots: self.pending_deferred_constraint_slots,
+            deferred_constraint_patches: self.deferred_constraint_patches.clone(),
+            deferred_patch_a_cols: self.deferred_patch_a_cols.clone(),
+            deferred_patch_a_value_indices: self.deferred_patch_a_value_indices.clone(),
+            deferred_patch_b_cols: self.deferred_patch_b_cols.clone(),
+            deferred_patch_b_value_indices: self.deferred_patch_b_value_indices.clone(),
+            tower_bit_wires: self.tower_bit_wires.clone(),
+            tower_bit_nested_bytes: self.tower_bit_nested_bytes,
+            product_observer: None,
+            fused_boolean_pins: false,
+            reuse_linear_rows: false,
+            reused_linear_pins: self.reused_linear_pins,
+            symbolic_product_aliases: false,
+            constant_product_wires: std::collections::HashMap::new(),
+            product_alias_stats: self.product_alias_stats,
+            checked_boolean_gates: std::collections::HashSet::new(),
+            checked_boolean_gate_bytes: 0,
+            boolean_pin_stats: self.boolean_pin_stats,
+            amun_fork_base: self.values.len(),
+            amun_fork_pending0: self.pending_deferred_witness_slots,
+        })
+    }
+
+    /// amun: append a fork taken with [`Self::amun_fork_witness_at`]`(start)`; this builder must now have
+    /// exactly `start` wires. The fork must have left everything below its base untouched (no sealing of
+    /// earlier deferred slots, no earlier value changes); anything else is an error and nothing is merged.
+    pub fn amun_join_witness(&mut self, fork: Self, start: usize) -> Result<(), &'static str> {
+        let base = fork.amun_fork_base;
+        if self.values.len() != start || fork.values.len() < start || base > start || base > self.values.len() {
+            return Err("fork join: wire count mismatch");
+        }
+        if fork.values[..base] != self.values[..base] || fork.deferred_witness_slots[..base] != self.deferred_witness_slots[..base] {
+            return Err("fork join: fork changed wires below its base");
+        }
+        if fork.pending_deferred_constraint_slots != self.pending_deferred_constraint_slots
+            || fork.deferred_constraint_patches.len() != self.deferred_constraint_patches.len()
+            || fork.deferred_patch_a_cols.len() != self.deferred_patch_a_cols.len()
+            || fork.deferred_patch_b_cols.len() != self.deferred_patch_b_cols.len()
+        {
+            return Err("fork join: deferred constraint state changed in the fork");
+        }
+        // Deferred witness slots allocated (and possibly still pending) inside the fork carry over.
+        if fork.pending_deferred_witness_slots < fork.amun_fork_pending0 {
+            return Err("fork join: fork sealed deferred slots it did not allocate");
+        }
+        self.values.extend_from_slice(&fork.values[start..]);
+        self.deferred_witness_slots.extend_from_slice(&fork.deferred_witness_slots[start..]);
+        self.pending_deferred_witness_slots += fork.pending_deferred_witness_slots - fork.amun_fork_pending0;
+        self.publics.extend(fork.publics);
+        for (key, bits) in fork.tower_bit_wires {
+            self.tower_bit_wires.entry(key).or_insert(bits);
+        }
+        self.tower_bit_nested_bytes = self.tower_bit_nested_bytes.max(fork.tower_bit_nested_bytes);
+        Ok(())
     }
 
     /// Allocated witness buffers and conservative retained bit-cache storage.

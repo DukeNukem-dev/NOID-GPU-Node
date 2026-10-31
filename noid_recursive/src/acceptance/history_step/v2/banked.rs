@@ -7,6 +7,7 @@
 
 use super::*;
 use noid_ivc_core::field_circuit::f128_from_u128;
+mod amun_fork;
 mod assembly;
 mod authorization_origin;
 mod bank;

@@ -119,25 +119,14 @@ fn prepare_assembly<const TIER: usize>(
         ..
     } = current;
     let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
-    let block = build_block_slots_selected_zk_prefix(
-        &mut builder,
-        &start_accumulator,
-        &end_accumulator,
-        &components,
-        &sealed_header,
-        TIER,
-        authorization,
-        &parent_header,
-        &parent_seal.block_id,
-        BlockRelationProfile::ScheduledV2(config),
-    );
+    // amun: the block-slots section (B) and the arms/finalize section (C) only share wires allocated before
+    // this point, so after one sequential assembly per class they are built in parallel on witness-only
+    // forks at the recorded wire offsets and merged in order (B, the pin between them, C).
+    let fork_w0 = builder.num_wires();
+    let gate_ref = &gate;
+    let section_c = |builder: &mut FieldR1csBuilder| -> Result<_, V2Error> {
     pin_eq(
-        &mut builder,
-        &parent_seal.height,
-        &block.slots().start_acc.height,
-    );
-    pin_eq(
-        &mut builder,
+        &mut *builder,
         &cells[ORIGIN_ACC],
         &LinExpr::constant(flat_of(noid_core::Block128(
             (config.activation_height() - 1) as u128,
@@ -145,7 +134,7 @@ fn prepare_assembly<const TIER: usize>(
     );
     let roots = envelopes
         .iter()
-        .map(|e| alloc_flat_digest(&mut builder, &e.proof().commitment.root))
+        .map(|e| alloc_flat_digest(&mut *builder, &e.proof().commitment.root))
         .collect::<Vec<_>>();
     let prev = envelopes[selected.index()]
         .proof()
@@ -153,10 +142,10 @@ fn prepare_assembly<const TIER: usize>(
         .iter()
         .map(|v| LinExpr::from_wire(builder.alloc_f128(*v)))
         .collect::<Vec<_>>();
-    let selectors = parent_selector(&mut builder, &prev[TIP_CLASS], selected);
+    let selectors = parent_selector(&mut *builder, &prev[TIP_CLASS], selected);
     // The entire ordered bank and sealed legacy boundary are inherited.
     for index in BANK..POINT {
-        pin_eq(&mut builder, &cells[index], &prev[index]);
+        pin_eq(&mut *builder, &cells[index], &prev[index]);
     }
     let mut obligations = Vec::new();
     let mut recorded_children = Vec::new();
@@ -166,20 +155,20 @@ fn prepare_assembly<const TIER: usize>(
         let entry = runtime.bank.config().class(arm);
         let envelope = envelopes[slot].proof();
         let proof = C1FieldR1csProofTrace::alloc_shape_mode(
-            &mut builder,
+            &mut *builder,
             &envelope.field,
             &entry.shape(),
             &params[slot],
             false,
         );
-        let arm_gate = mul(&mut builder, &gate, &selectors[slot]);
+        let arm_gate = mul(&mut *builder, &gate, &selectors[slot]);
         let mut arm_obligations = PcsWalkObligations::default();
         let mut recorder = BaseSelectableParentRecorder::new_c1(PROOF_DOMAIN);
         let mut child = None;
         let mut error = None;
         let (_, fresh) = with_pin_gate(&arm_gate, || {
             verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
-                &mut builder,
+                &mut *builder,
                 &mut recorder,
                 &entry.shape(),
                 &params[slot],
@@ -222,13 +211,13 @@ fn prepare_assembly<const TIER: usize>(
                 .collect(),
             value: ExtExpr::new(prev[lane.value].clone(), prev[lane.value + 1].clone()),
         };
-        let fold = C1MatrixFoldProofTrace::alloc(&mut builder, &folds[slot], entry.outer_m());
-        let mut channel = FsChannelTrace::new_c1(&mut builder, FOLD_DOMAIN);
-        channel.observe_label(&mut builder, ROUTE_DOMAIN);
-        channel.observe_lanes(&mut builder, 1, std::slice::from_ref(&prev[TIP_CLASS]));
+        let fold = C1MatrixFoldProofTrace::alloc(&mut *builder, &folds[slot], entry.outer_m());
+        let mut channel = FsChannelTrace::new_c1(&mut *builder, FOLD_DOMAIN);
+        channel.observe_label(&mut *builder, ROUTE_DOMAIN);
+        channel.observe_lanes(&mut *builder, 1, std::slice::from_ref(&prev[TIP_CLASS]));
         let outgoing = with_pin_gate(&arm_gate, || {
             verify_matrix_claim_fold_c1_trace(
-                &mut builder,
+                &mut *builder,
                 &mut channel,
                 entry.shape().k_log,
                 entry.shape().k_skip,
@@ -238,17 +227,17 @@ fn prepare_assembly<const TIER: usize>(
                 &fold,
             )
         });
-        bind_lane(&mut builder, &cells, &prev, lane, &arm_gate, &outgoing);
+        bind_lane(&mut *builder, &cells, &prev, lane, &arm_gate, &outgoing);
         // A new origin cannot import an unchecked v2 matrix claim.
         with_pin_gate(&cells[BASE], || {
             for cell in &cells[lane.point..=lane.live] {
-                pin_eq(&mut builder, cell, &LinExpr::zero());
+                pin_eq(&mut *builder, cell, &LinExpr::zero());
             }
         });
     }
-    let parent = with_pin_gate(&gate, || {
+    let parent = with_pin_gate(gate_ref, || {
         finalize_history_step_parent_region(
-            &mut builder,
+            &mut *builder,
             columns,
             &obligations,
             &selectors,
@@ -256,6 +245,73 @@ fn prepare_assembly<const TIER: usize>(
             &recorded_parents,
         )
     })?;
+        Ok((prev, parent))
+    };
+    let (block, prev, parent) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
+        Some((b_size, pin_size)) => {
+            let start2 = fork_w0 + b_size + pin_size;
+            let mut fb = builder.amun_fork_witness_at(fork_w0).map_err(|e| super::amun_fork::fail(e))?;
+            let mut fc = builder.amun_fork_witness_at(start2).map_err(|e| super::amun_fork::fail(e))?;
+            let (block, c_out) = rayon::join(
+                || {
+                    crate::acceptance::trace::with_clean_pin_gates(|| {
+        build_block_slots_selected_zk_prefix(
+                &mut fb,
+            &start_accumulator,
+            &end_accumulator,
+            &components,
+            &sealed_header,
+            TIER,
+            authorization,
+            &parent_header,
+            &parent_seal.block_id,
+            BlockRelationProfile::ScheduledV2(config),
+    )
+                    })
+                },
+                || section_c(&mut fc),
+            );
+            let (prev, parent) = c_out?;
+            if fb.num_wires() != fork_w0 + b_size {
+                return Err(super::amun_fork::fail("block-slots section size changed"));
+            }
+            builder.amun_join_witness(fb, fork_w0).map_err(|e| super::amun_fork::fail(e))?;
+            pin_eq(
+                &mut builder,
+                &parent_seal.height,
+                &block.slots().start_acc.height,
+            );
+            if builder.num_wires() != start2 {
+                return Err(super::amun_fork::fail("pin section size changed"));
+            }
+            builder.amun_join_witness(fc, start2).map_err(|e| super::amun_fork::fail(e))?;
+            (block, prev, parent)
+        }
+        None => {
+        let block = build_block_slots_selected_zk_prefix(
+            &mut builder,
+            &start_accumulator,
+            &end_accumulator,
+            &components,
+            &sealed_header,
+            TIER,
+            authorization,
+            &parent_header,
+            &parent_seal.block_id,
+            BlockRelationProfile::ScheduledV2(config),
+        );
+            let b_end = builder.num_wires();
+            pin_eq(
+                &mut builder,
+                &parent_seal.height,
+                &block.slots().start_acc.height,
+            );
+            let pin_end = builder.num_wires();
+            let (prev, parent) = section_c(&mut builder)?;
+            super::amun_fork::record(class.wire_id(), TIER, frozen, b_end - fork_w0, pin_end - b_end);
+            (block, prev, parent)
+        }
+    };
     for lane in 0..2 {
         with_pin_gate(&gate, || {
             pin_eq(
