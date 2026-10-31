@@ -285,6 +285,8 @@ pub struct TemplateBuilder {
     authorization_v2_config: Option<noid_recursive::acceptance::history_step::v2::banked::Config>,
     finance_config: Option<noid_recursive::acceptance::history_step::v2::capacity_banked::Config>,
     large_v2_mining: bool,
+    /// amun: build a coinbase-only template (no user transactions).
+    amun_skip_user_txs: bool,
 }
 
 impl TemplateBuilder {
@@ -294,8 +296,16 @@ impl TemplateBuilder {
             v2_config: None,
             authorization_v2_config: None,
             finance_config: None,
+            amun_skip_user_txs: false,
             large_v2_mining: false,
         }
+    }
+
+    /// amun: coinbase-only template (the first template after a new tip: no state segments to hydrate or
+    /// commit, so proving starts ~0.7 s sooner; later refreshes at the same height include transactions).
+    pub fn amun_skip_user_txs(mut self, skip: bool) -> Self {
+        self.amun_skip_user_txs = skip;
+        self
     }
 
     pub fn with_history_protocol(mut self, runtime: &crate::HistoryProtocolRuntime) -> Self {
@@ -444,6 +454,18 @@ impl TemplateBuilder {
                 )
                 .await;
             (entries, pending, None, None)
+        };
+        let (entries, pending_outputs, v2_class) = if self.amun_skip_user_txs {
+            grouped_intents.clear();
+            trade_batches.clear();
+            trade_authorizations.clear();
+            (
+                Vec::new(),
+                Default::default(),
+                v2_class.map(|_| noid_recursive::acceptance::history_step::v2::banked::Class::Small),
+            )
+        } else {
+            (entries, pending_outputs, v2_class)
         };
         let has_versioned_class = v2_class.is_some() || v21_class.is_some();
         // Retain proof/opening pairs by logical id through group ordering and

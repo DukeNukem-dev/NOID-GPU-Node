@@ -714,6 +714,17 @@ impl Default for ExternalMiningAttemptInvalidator {
     }
 }
 
+fn amun_empty_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("NOID_EMPTY_FIRST").is_ok_and(|v| v == "0"))
+}
+
+/// True the first time a template is requested for this parent height.
+fn amun_first_template_for(parent_height: u64) -> bool {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    LAST.swap(parent_height, std::sync::atomic::Ordering::Relaxed) != parent_height
+}
+
 fn amun_template_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NOID_TEMPLATE_TRACE").is_ok_and(|v| v != "0"))
@@ -1436,6 +1447,9 @@ impl RpcHandler {
             .lock()
             .map_err(|_| rpc_err("external mining capacity lock poisoned"))?
             .page_limit();
+        // amun: the first template for a new parent is coinbase-only (NOID_EMPTY_FIRST=0 disables).
+        let first_for_parent = amun_first_template_for(snapshot.parent.height);
+        let builder = builder.amun_skip_user_txs(first_for_parent && amun_empty_first());
         let tmpl = builder
             .build_from_snapshot_with_limit(snapshot, addr, now, max_effective_pages)
             .await
