@@ -2259,6 +2259,41 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     }
 }
 
+mod amun_slots_split {
+    //! amun: wire-size plan for the selected-region / rest-of-slots split (see build_selected_zk_block_slots_core).
+    use noid_ivc_core::field_circuit::FieldR1csBuilder;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static PLANS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+    static DISABLED: AtomicBool = AtomicBool::new(false);
+    fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| !std::env::var("NOID_FORK").is_ok_and(|v| v == "0")) && !DISABLED.load(Ordering::Relaxed)
+    }
+    pub(super) fn plan(tier: usize) -> Option<usize> {
+        if !enabled() {
+            return None;
+        }
+        PLANS.lock().ok()?.as_ref()?.get(&tier).copied()
+    }
+    /// Record only from witness-only builders that can fork (the same ones the plan is used for).
+    pub(super) fn record(tier: usize, b: &FieldR1csBuilder, r_size: usize) {
+        if b.amun_fork_witness_at(b.num_wires()).is_err() {
+            return;
+        }
+        if let Ok(mut g) = PLANS.lock() {
+            if g.get_or_insert_with(HashMap::new).insert(tier, r_size).is_none() {
+                eprintln!("amun slots split: plan for tier {tier}: selected region {r_size} wires");
+            }
+        }
+    }
+    pub(super) fn fail(reason: &str) {
+        DISABLED.store(true, Ordering::Relaxed);
+        eprintln!("amun slots split: {reason}; split disabled");
+    }
+}
+
 fn build_selected_zk_block_slots_core(
     b: &mut FieldR1csBuilder,
     start_accumulator: &ChainAccumulator,
@@ -2936,7 +2971,341 @@ fn build_selected_zk_block_slots_core(
         None
     };
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: fee/burn/coinbase arithmetic");
-    let selected_region = Some(bind_selected_zk_block_region(
+    // amun: the selected-authorization region (R) and the rest of the slots up to action compaction (Y)
+    // share only earlier wires; after one sequential build per tier they are built in parallel on
+    // witness-only forks (R first in wire order) and merged before the paired exact-state step, which needs
+    // both. NOID_FORK=0 disables; any mismatch disables it for the process.
+    let amun_w_r = b.num_wires();
+    let mut amun_section_y = |b: &mut FieldR1csBuilder| {
+        let allocation = prepared_allocation.trace();
+        crate::acceptance::row_ledger_mark(
+            b,
+            &mut ledger,
+            "slots: selected auth+Meta/all-tiles assembly",
+        );
+        if matches!(profile, BlockRelationProfile::ScheduledV2(_)) {
+            pin_eq(b, &allocation.v2_active, &LinExpr::constant(F128::ONE));
+        }
+        prepared_allocation.finish(b);
+        // Only the deadline-selected authorization address is needed before the
+        // dyadically aligned selected-region allocation. Bind the remaining
+        // contract shape and execution semantics afterwards to avoid turning a
+        // few hundred useful rows into an otherwise empty 2^13 alignment gap.
+        if let Some(policy) = v2_contract_policy.as_ref() {
+            bind_v2_contract_partition(
+                b,
+                &page_surfaces,
+                v2_contract_views.as_ref().expect("object views"),
+                profile.native_sequential_config().is_none(),
+            );
+            bind_v2_contract_execution(
+                b,
+                &user_spine_inputs,
+                &page_surfaces,
+                v2_contract_views.as_ref().expect("object views"),
+                policy,
+                matches!(profile, BlockRelationProfile::ScheduledV2(config) if config.authorization_activation().is_some()),
+            );
+        }
+        crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: v2 contract execution");
+        crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: wallet plural/sidecar assembly");
+        // Totals: transaction and action counts now come from the same liveness
+        // and bitmap wires that feed compaction. All sums are INTEGERS
+        // (ripple-carry over tower bits), not GF(2^128) XOR.
+        // Tier capacity: count lanes bind to the same liveness sum that gates the
+        // selected proof tiles. TX_COUNT includes the mandatory coinbase.
+        let live_input_sum = pin_u64_sum(b, &selected_input_bits);
+        let output_sum = pin_u64_sum(b, &selected_output_bits);
+
+        // Exact active-slot counter equation as unsigned integers:
+        // parent + all mints (including coinbase) = child + all spends.
+        // Both additions reject u64 overflow instead of silently wrapping in the
+        // characteristic-two field.
+        bind_active_slot_counter_delta(
+            b,
+            &start_acc.active_slot_count,
+            &header.fields[hf::ACTIVE_SLOT_COUNT],
+            &live_input_sum,
+            &output_sum,
+        );
+
+        let class = super::shape::ShapeClass { tier };
+        assert_eq!(
+            action_candidates.len(),
+            class.action_candidate_capacity(),
+            "three fixed system candidates plus ten per tier user slot"
+        );
+        let input_capacity = match profile {
+            BlockRelationProfile::ScheduledV2(config) => config.max_live_inputs(),
+            _ => class.spend_capacity(),
+        };
+        bind_block_input_limit(b, &live_input_sum, input_capacity);
+        let action_live_capacity = geometry.touched_capacity;
+        if profile.native_namespace() {
+            let mut native_mints = vec![LinExpr::zero(); 3];
+            if let Some(selectors) = native_action_selectors.as_ref() {
+                native_mints.extend(selectors.native.iter().enumerate().map(|(index, native)| {
+                    if index % 10 >= 8 {
+                        native.clone()
+                    } else {
+                        LinExpr::zero()
+                    }
+                }));
+            } else {
+                native_mints.resize(action_candidates.len(), LinExpr::zero());
+            }
+            super::trace::action_compaction::bind_native_mint_packed_values_body_order(
+                b,
+                &mut action_candidates,
+                &start_acc.alloc_counter,
+                &header.fields[hf::ALLOC_COUNTER],
+                &header.fields[hf::HEIGHT],
+                &native_mints,
+            );
+        } else {
+            bind_mint_packed_values_body_order(
+                b,
+                &mut action_candidates,
+                &start_acc.alloc_counter,
+                &header.fields[hf::ALLOC_COUNTER],
+                &header.fields[hf::HEIGHT],
+            );
+        }
+        if let Some(selectors) = native_action_selectors.as_ref() {
+            let openings = components
+                .native_openings
+                .iter()
+                .map(|opening| (opening.root(), *opening))
+                .collect::<std::collections::HashMap<_, _>>();
+            let capacity = match profile {
+                BlockRelationProfile::ScheduledV2(config) => config.native_action_capacity().unwrap(),
+                _ => unreachable!("native actions use the scheduled profile"),
+            };
+            if let Some(financial) = financial_config {
+                use super::trace::native_assets::{
+                    financial_actions::{bind_financial_actions, bind_sequential_financial_actions},
+                    financial_kernel::{self, FinancialKernelBody, FinancialKernelBoundary},
+                };
+                let headers = financial_headers.as_ref().expect("financial headers");
+                let mut native_ledger = b.num_wires();
+                let actions = if sequential_config.is_some() {
+                    bind_sequential_financial_actions(
+                        b,
+                        &action_candidates[3..],
+                        selectors,
+                        &paged_spend.native_pages,
+                        headers,
+                        capacity,
+                        |root| openings.get(&root).copied(),
+                    )
+                } else {
+                    bind_financial_actions(
+                        b,
+                        &action_candidates[3..],
+                        selectors,
+                        &paged_spend.native_pages,
+                        headers,
+                        capacity,
+                        |root| openings.get(&root).copied(),
+                    )
+                };
+                crate::acceptance::row_ledger_mark(
+                    b,
+                    &mut native_ledger,
+                    "native: complete action table",
+                );
+                let mut definitions = components
+                    .native_openings
+                    .iter()
+                    .copied()
+                    .filter(noid_tx::native_assets::NativeOpening::is_auxiliary)
+                    .collect::<Vec<_>>();
+                definitions.sort_by_key(|opening| opening.root().0);
+                let body = FinancialKernelBody {
+                    actions: &actions,
+                    headers,
+                    surfaces: &page_surfaces,
+                    pages: &paged_spend.native_pages,
+                };
+                let boundary = FinancialKernelBoundary {
+                    height: &header.fields[hf::HEIGHT],
+                    parent_id: parent_block_id,
+                    parent_alloc_counter: &start_acc.alloc_counter,
+                };
+                let prepared = if sequential_config.is_some() {
+                    financial_kernel::bind_financial_sequential_preparation(
+                        b,
+                        financial.kernel,
+                        &body,
+                        &boundary,
+                        &definitions,
+                    )
+                } else if financial.phase == financial_kernel::FinancialKernelPhase::Settlement {
+                    financial_kernel::bind_financial_settlement_preparation(
+                        b,
+                        financial.kernel,
+                        &body,
+                        &boundary,
+                        &definitions,
+                    )
+                } else {
+                    financial_kernel::bind_financial_preparation(
+                        b,
+                        financial.kernel,
+                        &body,
+                        &boundary,
+                        &definitions,
+                    )
+                };
+                crate::acceptance::row_ledger_mark(b, &mut native_ledger, "native: typed preparation");
+                let fees = &financial_fees
+                    .as_ref()
+                    .expect("financial fee context")
+                    .required_by_header;
+                if let Some(trade_config) = sequential_config {
+                    financial_kernel::bind_financial_sequential_owner_operations(
+                        b, &body, &prepared, &boundary, fees,
+                    );
+                    crate::acceptance::row_ledger_mark(
+                        b,
+                        &mut native_ledger,
+                        "native: launch and NFT rights",
+                    );
+                    use super::trace::native_assets::sequential_trade::{
+                        authorization::bind_trade_owner_advice,
+                        fees::bind_trade_growth_price,
+                        kernel::{bind_trade_kernel, TradeKernelContext},
+                    };
+                    let growth = bind_trade_growth_price(
+                        b,
+                        &financial_fees
+                            .as_ref()
+                            .expect("financial fee context")
+                            .block
+                            .pressure_multiplier,
+                    );
+                    let chain = noid_poseidon2b::primitives::Address(
+                        noid_chain::state::native_assets::native_chain_id(),
+                    )
+                    .as_fields()
+                    .map(const_block);
+                    let context = TradeKernelContext {
+                        chain: &chain,
+                        epoch_anchor: &end_acc.epoch_anchor_id,
+                        parent_id: parent_block_id,
+                        height: &header.fields[hf::HEIGHT],
+                        parent_alloc_counter: &start_acc.alloc_counter,
+                        growth_per_slot: &growth,
+                    };
+                    let trade = bind_trade_kernel(
+                        b,
+                        trade_config,
+                        &context,
+                        headers,
+                        &actions,
+                        &prepared.definitions,
+                        &components.native_trade_batches,
+                    );
+                    crate::acceptance::row_ledger_mark(
+                        b,
+                        &mut native_ledger,
+                        "native: sequential trade kernel",
+                    );
+                    bind_trade_owner_advice(
+                        b,
+                        trade_authorization_advice
+                            .as_ref()
+                            .expect("sequential Owner advice"),
+                        &trade.authorizations,
+                    );
+                    crate::acceptance::row_ledger_mark(
+                        b,
+                        &mut native_ledger,
+                        "native: Owner advice binding",
+                    );
+                } else if financial.phase != financial_kernel::FinancialKernelPhase::Settlement {
+                    financial_kernel::bind_financial_owner_operations(
+                        b, &body, &prepared, &boundary, fees,
+                    );
+                }
+                if sequential_config.is_none()
+                    && financial.phase != financial_kernel::FinancialKernelPhase::Admission
+                {
+                    financial_kernel::bind_financial_settlements(
+                        b,
+                        financial.kernel,
+                        &body,
+                        &prepared,
+                        &header.fields[hf::HEIGHT],
+                        fees,
+                        &[],
+                    );
+                }
+            } else {
+                let native_actions = super::trace::native_assets::actions::bind_native_actions(
+                    b,
+                    &action_candidates[3..],
+                    selectors,
+                    &paged_spend.native_pages,
+                    native_headers.as_ref().expect("native headers"),
+                    &header.fields[hf::HEIGHT],
+                    capacity,
+                    |root| openings.get(&root).copied(),
+                );
+                super::trace::native_assets::kernel::bind_native_kernel(
+                    b,
+                    native_headers.as_ref().expect("native headers"),
+                    &native_actions,
+                    &header.fields[hf::HEIGHT],
+                );
+            }
+        }
+        crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: native object actions");
+        let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
+        crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
+        compacted_actions
+    };
+    let (selected_region, compacted_actions) = match amun_slots_split::plan(tier) {
+        Some(r_size) => {
+            let forks = b
+                .amun_fork_witness_at(amun_w_r)
+                .and_then(|fr| b.amun_fork_witness_at(amun_w_r + r_size).map(|fy| (fr, fy)));
+            match forks {
+                Ok((mut fr, mut fy)) => {
+                    let (compacted_actions, region) = rayon::join(
+                        || amun_section_y(&mut fy),
+                        || {
+                            crate::acceptance::trace::with_clean_pin_gates(|| {
+                                bind_selected_zk_block_region(
+            &mut fr,
+            canonical_authorization,
+            authorization_proofs,
+            es_region_data
+            .as_ref()
+            .expect("selected exact-state region data"),
+            tx_root_region_data
+            .as_ref()
+            .expect("selected tx-root region data"),
+            spine_region_data
+            .as_ref()
+            .expect("selected spine region data"),
+            geometry,
+                                )
+                            })
+                        },
+                    );
+                    if fr.num_wires() != amun_w_r + r_size {
+                        amun_slots_split::fail("selected region size changed");
+                        panic!("amun slots split: selected region size changed");
+                    }
+                    if let Err(e) = b.amun_join_witness(fr, amun_w_r).and_then(|_| b.amun_join_witness(fy, amun_w_r + r_size)) {
+                        amun_slots_split::fail(e);
+                        panic!("amun slots split: {e}");
+                    }
+                    (Some(region), compacted_actions)
+                }
+                Err(_) => {
+                    let selected_region = Some(bind_selected_zk_block_region(
         b,
         canonical_authorization,
         authorization_proofs,
@@ -2950,292 +3319,33 @@ fn build_selected_zk_block_slots_core(
             .as_ref()
             .expect("selected spine region data"),
         geometry,
-    ));
-    crate::acceptance::row_ledger_mark(
-        b,
-        &mut ledger,
-        "slots: selected auth+Meta/all-tiles assembly",
-    );
-    if matches!(profile, BlockRelationProfile::ScheduledV2(_)) {
-        pin_eq(b, &allocation.v2_active, &LinExpr::constant(F128::ONE));
-    }
-    prepared_allocation.finish(b);
-    // Only the deadline-selected authorization address is needed before the
-    // dyadically aligned selected-region allocation. Bind the remaining
-    // contract shape and execution semantics afterwards to avoid turning a
-    // few hundred useful rows into an otherwise empty 2^13 alignment gap.
-    if let Some(policy) = v2_contract_policy.as_ref() {
-        bind_v2_contract_partition(
-            b,
-            &page_surfaces,
-            v2_contract_views.as_ref().expect("object views"),
-            profile.native_sequential_config().is_none(),
-        );
-        bind_v2_contract_execution(
-            b,
-            &user_spine_inputs,
-            &page_surfaces,
-            v2_contract_views.as_ref().expect("object views"),
-            policy,
-            matches!(profile, BlockRelationProfile::ScheduledV2(config) if config.authorization_activation().is_some()),
-        );
-    }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: v2 contract execution");
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: wallet plural/sidecar assembly");
-    // Totals: transaction and action counts now come from the same liveness
-    // and bitmap wires that feed compaction. All sums are INTEGERS
-    // (ripple-carry over tower bits), not GF(2^128) XOR.
-    // Tier capacity: count lanes bind to the same liveness sum that gates the
-    // selected proof tiles. TX_COUNT includes the mandatory coinbase.
-    let live_input_sum = pin_u64_sum(b, &selected_input_bits);
-    let output_sum = pin_u64_sum(b, &selected_output_bits);
-
-    // Exact active-slot counter equation as unsigned integers:
-    // parent + all mints (including coinbase) = child + all spends.
-    // Both additions reject u64 overflow instead of silently wrapping in the
-    // characteristic-two field.
-    bind_active_slot_counter_delta(
-        b,
-        &start_acc.active_slot_count,
-        &header.fields[hf::ACTIVE_SLOT_COUNT],
-        &live_input_sum,
-        &output_sum,
-    );
-
-    let class = super::shape::ShapeClass { tier };
-    assert_eq!(
-        action_candidates.len(),
-        class.action_candidate_capacity(),
-        "three fixed system candidates plus ten per tier user slot"
-    );
-    let input_capacity = match profile {
-        BlockRelationProfile::ScheduledV2(config) => config.max_live_inputs(),
-        _ => class.spend_capacity(),
-    };
-    bind_block_input_limit(b, &live_input_sum, input_capacity);
-    let action_live_capacity = geometry.touched_capacity;
-    if profile.native_namespace() {
-        let mut native_mints = vec![LinExpr::zero(); 3];
-        if let Some(selectors) = native_action_selectors.as_ref() {
-            native_mints.extend(selectors.native.iter().enumerate().map(|(index, native)| {
-                if index % 10 >= 8 {
-                    native.clone()
-                } else {
-                    LinExpr::zero()
+                    ));
+                    (selected_region, amun_section_y(b))
                 }
-            }));
-        } else {
-            native_mints.resize(action_candidates.len(), LinExpr::zero());
-        }
-        super::trace::action_compaction::bind_native_mint_packed_values_body_order(
-            b,
-            &mut action_candidates,
-            &start_acc.alloc_counter,
-            &header.fields[hf::ALLOC_COUNTER],
-            &header.fields[hf::HEIGHT],
-            &native_mints,
-        );
-    } else {
-        bind_mint_packed_values_body_order(
-            b,
-            &mut action_candidates,
-            &start_acc.alloc_counter,
-            &header.fields[hf::ALLOC_COUNTER],
-            &header.fields[hf::HEIGHT],
-        );
-    }
-    if let Some(selectors) = native_action_selectors.as_ref() {
-        let openings = components
-            .native_openings
-            .iter()
-            .map(|opening| (opening.root(), *opening))
-            .collect::<std::collections::HashMap<_, _>>();
-        let capacity = match profile {
-            BlockRelationProfile::ScheduledV2(config) => config.native_action_capacity().unwrap(),
-            _ => unreachable!("native actions use the scheduled profile"),
-        };
-        if let Some(financial) = financial_config {
-            use super::trace::native_assets::{
-                financial_actions::{bind_financial_actions, bind_sequential_financial_actions},
-                financial_kernel::{self, FinancialKernelBody, FinancialKernelBoundary},
-            };
-            let headers = financial_headers.as_ref().expect("financial headers");
-            let mut native_ledger = b.num_wires();
-            let actions = if sequential_config.is_some() {
-                bind_sequential_financial_actions(
-                    b,
-                    &action_candidates[3..],
-                    selectors,
-                    &paged_spend.native_pages,
-                    headers,
-                    capacity,
-                    |root| openings.get(&root).copied(),
-                )
-            } else {
-                bind_financial_actions(
-                    b,
-                    &action_candidates[3..],
-                    selectors,
-                    &paged_spend.native_pages,
-                    headers,
-                    capacity,
-                    |root| openings.get(&root).copied(),
-                )
-            };
-            crate::acceptance::row_ledger_mark(
-                b,
-                &mut native_ledger,
-                "native: complete action table",
-            );
-            let mut definitions = components
-                .native_openings
-                .iter()
-                .copied()
-                .filter(noid_tx::native_assets::NativeOpening::is_auxiliary)
-                .collect::<Vec<_>>();
-            definitions.sort_by_key(|opening| opening.root().0);
-            let body = FinancialKernelBody {
-                actions: &actions,
-                headers,
-                surfaces: &page_surfaces,
-                pages: &paged_spend.native_pages,
-            };
-            let boundary = FinancialKernelBoundary {
-                height: &header.fields[hf::HEIGHT],
-                parent_id: parent_block_id,
-                parent_alloc_counter: &start_acc.alloc_counter,
-            };
-            let prepared = if sequential_config.is_some() {
-                financial_kernel::bind_financial_sequential_preparation(
-                    b,
-                    financial.kernel,
-                    &body,
-                    &boundary,
-                    &definitions,
-                )
-            } else if financial.phase == financial_kernel::FinancialKernelPhase::Settlement {
-                financial_kernel::bind_financial_settlement_preparation(
-                    b,
-                    financial.kernel,
-                    &body,
-                    &boundary,
-                    &definitions,
-                )
-            } else {
-                financial_kernel::bind_financial_preparation(
-                    b,
-                    financial.kernel,
-                    &body,
-                    &boundary,
-                    &definitions,
-                )
-            };
-            crate::acceptance::row_ledger_mark(b, &mut native_ledger, "native: typed preparation");
-            let fees = &financial_fees
-                .as_ref()
-                .expect("financial fee context")
-                .required_by_header;
-            if let Some(trade_config) = sequential_config {
-                financial_kernel::bind_financial_sequential_owner_operations(
-                    b, &body, &prepared, &boundary, fees,
-                );
-                crate::acceptance::row_ledger_mark(
-                    b,
-                    &mut native_ledger,
-                    "native: launch and NFT rights",
-                );
-                use super::trace::native_assets::sequential_trade::{
-                    authorization::bind_trade_owner_advice,
-                    fees::bind_trade_growth_price,
-                    kernel::{bind_trade_kernel, TradeKernelContext},
-                };
-                let growth = bind_trade_growth_price(
-                    b,
-                    &financial_fees
-                        .as_ref()
-                        .expect("financial fee context")
-                        .block
-                        .pressure_multiplier,
-                );
-                let chain = noid_poseidon2b::primitives::Address(
-                    noid_chain::state::native_assets::native_chain_id(),
-                )
-                .as_fields()
-                .map(const_block);
-                let context = TradeKernelContext {
-                    chain: &chain,
-                    epoch_anchor: &end_acc.epoch_anchor_id,
-                    parent_id: parent_block_id,
-                    height: &header.fields[hf::HEIGHT],
-                    parent_alloc_counter: &start_acc.alloc_counter,
-                    growth_per_slot: &growth,
-                };
-                let trade = bind_trade_kernel(
-                    b,
-                    trade_config,
-                    &context,
-                    headers,
-                    &actions,
-                    &prepared.definitions,
-                    &components.native_trade_batches,
-                );
-                crate::acceptance::row_ledger_mark(
-                    b,
-                    &mut native_ledger,
-                    "native: sequential trade kernel",
-                );
-                bind_trade_owner_advice(
-                    b,
-                    trade_authorization_advice
-                        .as_ref()
-                        .expect("sequential Owner advice"),
-                    &trade.authorizations,
-                );
-                crate::acceptance::row_ledger_mark(
-                    b,
-                    &mut native_ledger,
-                    "native: Owner advice binding",
-                );
-            } else if financial.phase != financial_kernel::FinancialKernelPhase::Settlement {
-                financial_kernel::bind_financial_owner_operations(
-                    b, &body, &prepared, &boundary, fees,
-                );
             }
-            if sequential_config.is_none()
-                && financial.phase != financial_kernel::FinancialKernelPhase::Admission
-            {
-                financial_kernel::bind_financial_settlements(
-                    b,
-                    financial.kernel,
-                    &body,
-                    &prepared,
-                    &header.fields[hf::HEIGHT],
-                    fees,
-                    &[],
-                );
-            }
-        } else {
-            let native_actions = super::trace::native_assets::actions::bind_native_actions(
-                b,
-                &action_candidates[3..],
-                selectors,
-                &paged_spend.native_pages,
-                native_headers.as_ref().expect("native headers"),
-                &header.fields[hf::HEIGHT],
-                capacity,
-                |root| openings.get(&root).copied(),
-            );
-            super::trace::native_assets::kernel::bind_native_kernel(
-                b,
-                native_headers.as_ref().expect("native headers"),
-                &native_actions,
-                &header.fields[hf::HEIGHT],
-            );
         }
-    }
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: native object actions");
-    let compacted_actions = compact_action_rows(b, &action_candidates, action_live_capacity);
-    crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: action allocator+route+order");
+        None => {
+            let selected_region = Some(bind_selected_zk_block_region(
+        b,
+        canonical_authorization,
+        authorization_proofs,
+        es_region_data
+            .as_ref()
+            .expect("selected exact-state region data"),
+        tx_root_region_data
+            .as_ref()
+            .expect("selected tx-root region data"),
+        spine_region_data
+            .as_ref()
+            .expect("selected spine region data"),
+        geometry,
+            ));
+            let r_size = b.num_wires() - amun_w_r;
+            let compacted_actions = amun_section_y(b);
+            amun_slots_split::record(tier, b, r_size);
+            (selected_region, compacted_actions)
+        }
+    };
 
     let paired_cells = selected_region
         .as_ref()
