@@ -35,7 +35,7 @@ pub type Hash = [u8; 32];
 
 #[cfg(target_os = "linux")]
 #[path = "merkle_gpu.rs"]
-mod gpu;
+pub(crate) mod gpu;
 
 const POSEIDON_MERKLE_LEAF_TAG: DomainTag = DomainTag::new(b"IVCPCSL_");
 /// Fixed-length (no-pad) leaf mode: block-aligned leaves skip the padding

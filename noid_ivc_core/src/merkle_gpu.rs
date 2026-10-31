@@ -24,14 +24,30 @@ fn split(v: u128) -> (u64, u64) {
 }
 
 fn tree_on(g: &mut Gpu, data: &[u8], num_leaves: usize, leaf_size: usize, tree: &mut [Hash]) -> Result<(), String> {
-    const BLOCK: u32 = 128;
-    let tree_bytes = tree.len() * 32;
     let mut bufs = std::mem::take(&mut g.merkle);
     bufs.resize_with(2, DBuf::default);
     let result = (|| {
-        let mut d_data = g.ensure(&mut bufs[0], data.len())?;
-        let d_tree = g.ensure(&mut bufs[1], tree_bytes)?;
+        let d_data = g.ensure(&mut bufs[0], data.len())?;
         g.htod(d_data, data)?;
+        tree_from_device(g, &mut bufs[1], d_data, num_leaves, leaf_size, tree)
+    })();
+    g.merkle = bufs;
+    result
+}
+
+/// The tree of `num_leaves` leaves of `leaf_size` bytes already on the device at `d_data`.
+pub(crate) fn tree_from_device(
+    g: &Gpu,
+    tree_buf: &mut DBuf,
+    mut d_data: crate::gpu::DevPtr,
+    num_leaves: usize,
+    leaf_size: usize,
+    tree: &mut [Hash],
+) -> Result<(), String> {
+    const BLOCK: u32 = 128;
+    let tree_bytes = tree.len() * 32;
+    {
+        let d_tree = g.ensure(tree_buf, tree_bytes)?;
         let k_leaves = g.function(c"merkle_leaves")?;
         let k_level = g.function(c"merkle_level")?;
 
@@ -65,13 +81,11 @@ fn tree_on(g: &mut Gpu, data: &[u8], num_leaves: usize, leaf_size: usize, tree: 
         }
         g.sync()?;
         g.dtoh(tree, d_tree)
-    })();
-    g.merkle = bufs;
-    result
+    }
 }
 
 /// Spot-check a GPU tree on the CPU: 8 leaves and 8 parents at pseudo-random positions per call.
-fn spot_check(data: &[u8], num_leaves: usize, leaf_size: usize, tree: &[Hash], seed: u64) -> bool {
+pub(crate) fn spot_check(data: &[u8], num_leaves: usize, leaf_size: usize, tree: &[Hash], seed: u64) -> bool {
     let mut x = seed ^ 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
         x ^= x << 13;

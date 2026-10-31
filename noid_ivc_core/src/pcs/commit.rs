@@ -411,12 +411,30 @@ fn fill_fused_two_layer_replica(
 
 /// Shared tail of [`commit`] / [`commit_into`]: interleaved forward additive
 /// NTT (RS-encode every lane) then the initial Merkle tree over codeword rows.
+#[cfg(target_os = "linux")]
+#[path = "commit_gpu.rs"]
+mod commit_gpu;
+
 fn finalize_commit(
     z_packed: &[F128],
-    mut codeword: Vec<F128>,
+    #[allow(unused_mut)] mut codeword: Vec<F128>,
     params: &PcsParams,
 ) -> (Commitment, ProverData) {
     let timing = std::env::var_os("NOIDH_COMMIT_TIMING").is_some();
+    // amun: the whole commit on the GPU when available (checked; CPU fallback on any problem).
+    #[cfg(target_os = "linux")]
+    {
+        let t_gpu = std::time::Instant::now();
+        match commit_gpu::try_commit(z_packed, codeword, params) {
+            Ok(out) => {
+                if timing {
+                    eprintln!("[commit-timing] gpu commit (ntt + merkle + copy back): {:.2} ms", t_gpu.elapsed().as_secs_f64() * 1e3);
+                }
+                return out;
+            }
+            Err(buffer) => codeword = buffer,
+        }
+    }
     let t_ntt = std::time::Instant::now();
     // ---- Interleaved forward additive NTT: 2^log_batch_size independent
     // sub-NTTs with shared twiddles. Each sub-NTT operates on its lane of the

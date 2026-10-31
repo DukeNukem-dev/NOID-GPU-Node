@@ -501,3 +501,24 @@ extern "C" __global__ void dwb_window(const rdesc *d, uint64_t base, uint64_t le
     for (uint64_t k = 1; k < len; k++) { s = dw_round((int)(base + k - 1), s, rc, mds); r.win[k * r.n + i] = s; }
   }
 }
+
+// ---------------------------------------------------------------- PCS commit: interleaved additive NTT (pcs/commit.rs)
+// Codeword layout: data[pos * num_ntts + lane]. Replicate the message (first msg_len values) across the buffer.
+extern "C" __global__ void ntt_replicate(u128 *data, uint64_t msg_len, uint64_t total) {
+  for (uint64_t i = GID + msg_len; i < total; i += GSTRIDE) data[i] = data[i % msg_len];
+}
+// One forward layer: pairs (top, top + half) inside each block of 2*half positions, all lanes;
+// u' = u + v * t, v' = v + u'. t = span(row, block) = XOR of row[j] for set bits j of the block index.
+extern "C" __global__ void ntt_layer(u128 *data, uint64_t pairs, uint64_t num_ntts, uint64_t half_log, const u128 *row) {
+  uint64_t half = 1ull << half_log;
+  for (uint64_t i = GID; i < pairs * num_ntts; i += GSTRIDE) {
+    uint64_t lane = i % num_ntts, pair = i / num_ntts;
+    uint64_t block = pair >> half_log, r = pair & (half - 1);
+    uint64_t top = (block * 2 * half + r) * num_ntts + lane, bot = top + half * num_ntts;
+    u128 t = {0, 0};
+    for (uint64_t j = 0, b = block; b; j++, b >>= 1) if (b & 1) t = x(t, row[j]);
+    u128 u = data[top], v = data[bot];
+    u128 nu = x(u, mul(v, t));
+    data[top] = nu; data[bot] = x(v, nu);
+  }
+}
