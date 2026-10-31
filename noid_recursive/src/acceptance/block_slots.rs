@@ -2259,6 +2259,15 @@ pub(in crate::acceptance) fn build_block_slots_selected_zk_prefix(
     }
 }
 
+struct AmunTraceOnDrop(&'static str, std::time::Instant);
+impl Drop for AmunTraceOnDrop {
+    fn drop(&mut self) {
+        if std::env::var_os("NOID_FORK_TRACE").is_some() {
+            eprintln!("amun fork trace: {} {:.0} ms", self.0, self.1.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+}
+
 mod amun_slots_split {
     //! amun: wire-size plan for the selected-region / rest-of-slots split (see build_selected_zk_block_slots_core).
     use noid_ivc_core::field_circuit::FieldR1csBuilder;
@@ -3272,10 +3281,18 @@ fn build_selected_zk_block_slots_core(
                 .and_then(|fr| b.amun_fork_witness_at(amun_w_r + r_size).map(|fy| (fr, fy)));
             match forks {
                 Ok((mut fr, mut fy)) => {
+                    let amun_t = std::time::Instant::now();
                     let (compacted_actions, region) = rayon::join(
-                        || amun_section_y(&mut fy),
+                        || {
+                            let r = amun_section_y(&mut fy);
+                            if std::env::var_os("NOID_FORK_TRACE").is_some() {
+                                eprintln!("amun fork trace: slots Y {:.0} ms", amun_t.elapsed().as_secs_f64() * 1e3);
+                            }
+                            r
+                        },
                         || {
                             crate::acceptance::trace::with_clean_pin_gates(|| {
+                                let _t = AmunTraceOnDrop("slots R", amun_t);
                                 bind_selected_zk_block_region(
             &mut fr,
             canonical_authorization,

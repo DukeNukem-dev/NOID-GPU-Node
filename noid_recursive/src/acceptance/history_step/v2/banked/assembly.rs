@@ -256,14 +256,19 @@ fn prepare_assembly<const TIER: usize>(
             let start2 = w0 + b_size + pin_size;
             let mut fa = builder.amun_fork_witness_at(fork_wa).map_err(|e| super::amun_fork::fail(e))?;
             let mut fs = builder.amun_fork_witness_at(w_seal).map_err(|e| super::amun_fork::fail(e))?;
+            let amun_t = std::time::Instant::now();
             let (left, right) = rayon::join(
                 || -> Result<_, V2Error> {
                     let columns = section_a(&mut fa)?;
+                    let amun_ta = amun_t.elapsed();
                     if fa.num_wires() != w_seal {
                         return Err(super::amun_fork::fail("parent-columns section size changed"));
                     }
                     let mut fc = fa.amun_fork_witness_at(start2).map_err(|e| super::amun_fork::fail(e))?;
                     let (prev, parent) = section_c(&mut fc, columns)?;
+                    if super::amun_fork::trace() {
+                        eprintln!("amun fork trace: A {:.0} ms, A+C {:.0} ms", amun_ta.as_secs_f64() * 1e3, amun_t.elapsed().as_secs_f64() * 1e3);
+                    }
                     Ok((fa, fc, prev, parent))
                 },
                 || {
@@ -281,6 +286,9 @@ fn prepare_assembly<const TIER: usize>(
                             &parent_seal.block_id,
                             BlockRelationProfile::ScheduledV2(config),
                         );
+                        if super::amun_fork::trace() {
+                            eprintln!("amun fork trace: S+B {:.0} ms", amun_t.elapsed().as_secs_f64() * 1e3);
+                        }
                         (fs, parent_seal, block)
                     })
                 },

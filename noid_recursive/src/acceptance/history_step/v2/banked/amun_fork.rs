@@ -16,6 +16,11 @@ fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("NOID_FORK").is_ok_and(|v| v == "0")) && !DISABLED.load(Ordering::Relaxed)
 }
 
+pub(super) fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NOID_FORK_TRACE").is_ok_and(|v| v != "0"))
+}
+
 pub(super) fn plan(class: u8, tier: usize, frozen: bool) -> Option<(usize, usize, usize, usize)> {
     if frozen || !enabled() {
         return None;
