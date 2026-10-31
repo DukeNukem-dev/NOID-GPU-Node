@@ -90,6 +90,18 @@ struct State {
 
 const F: usize = std::mem::size_of::<F256>();
 
+/// Release the large per-proof work tables (the cached matrix stays); other GPU stages need the memory.
+fn free_work(g: &Gpu, w: &mut Work) {
+    for b in [&mut w.rest, &mut w.v, &mut w.e, &mut w.inner, &mut w.lambda, &mut w.zp, &mut w.v2, &mut w.eqlo, &mut w.eqhi, &mut w.partials] {
+        g.free(b);
+    }
+    for arr in [&mut w.gv, &mut w.ge, &mut w.u, &mut w.inc, &mut w.h] {
+        for b in arr.iter_mut() {
+            g.free(b);
+        }
+    }
+}
+
 fn kernels(g: &Gpu) -> Result<Kernels, String> {
     Ok(Kernels {
         eq_step: g.function(c"eq_step")?,
@@ -560,6 +572,7 @@ fn try_prove_min<Ch: Challenger>(
     }
     let t1 = Instant::now();
     let out = transcript(&mut g, &mut st, &k, k_log, fresh, incoming, gate, channel);
+    free_work(&g, &mut st.work);
     g.fold = Some(st);
     match out {
         Ok(out) => {
@@ -702,6 +715,7 @@ fn try_fold_alpha_quirky_min(
         g.dtoh(&mut host, comb)?;
         Ok(host)
     })();
+    free_work(&g, &mut st.work);
     g.fold = Some(st);
     match result {
         Ok(v) => Some(v),
