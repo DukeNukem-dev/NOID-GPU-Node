@@ -127,6 +127,7 @@ fn prepare_assembly<const TIER: usize>(
     } = current;
     let gate_ref = &gate;
     let section_c = |builder: &mut FieldR1csBuilder, columns| -> Result<_, V2Error> {
+        let amun_tc = std::time::Instant::now();
     pin_eq(
         &mut *builder,
         &cells[ORIGIN_ACC],
@@ -152,7 +153,11 @@ fn prepare_assembly<const TIER: usize>(
     let mut obligations = Vec::new();
     let mut recorded_children = Vec::new();
     let mut recorded_parents = Vec::new();
+    if super::amun_fork::trace() {
+        eprintln!("amun fork trace: C pre-arms {:.0} ms", amun_tc.elapsed().as_secs_f64() * 1e3);
+    }
     for arm in Class::ALL {
+        let amun_tarm = std::time::Instant::now();
         let slot = arm.index();
         let entry = runtime.bank.config().class(arm);
         let envelope = envelopes[slot].proof();
@@ -236,7 +241,11 @@ fn prepare_assembly<const TIER: usize>(
                 pin_eq(&mut *builder, cell, &LinExpr::zero());
             }
         });
+        if super::amun_fork::trace() {
+            eprintln!("amun fork trace: C arm {slot} {:.0} ms ({} wires so far)", amun_tarm.elapsed().as_secs_f64() * 1e3, builder.num_wires());
+        }
     }
+    let amun_tfin = std::time::Instant::now();
     let parent = with_pin_gate(gate_ref, || {
         finalize_history_step_parent_region(
             &mut *builder,
@@ -247,6 +256,9 @@ fn prepare_assembly<const TIER: usize>(
             &recorded_parents,
         )
     })?;
+        if super::amun_fork::trace() {
+            eprintln!("amun fork trace: C finalize {:.0} ms", amun_tfin.elapsed().as_secs_f64() * 1e3);
+        }
         Ok((prev, parent))
     };
     let (parent_seal, block, prev, parent) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
