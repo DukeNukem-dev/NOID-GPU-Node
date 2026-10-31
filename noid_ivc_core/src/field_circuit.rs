@@ -906,6 +906,16 @@ impl FieldR1csBuilder {
             return Err("fork join: wire count mismatch");
         }
         if fork.values[..base] != self.values[..base] || fork.deferred_witness_slots[..base] != self.deferred_witness_slots[..base] {
+            let changed: Vec<usize> = (0..base)
+                .filter(|&i| fork.values[i] != self.values[i] || fork.deferred_witness_slots[i] != self.deferred_witness_slots[i])
+                .collect();
+            eprintln!(
+                "amun fork: join at {start} (base {base}): {} wires below the base changed, first {:?}, flags parent {:?} fork {:?}",
+                changed.len(),
+                &changed[..changed.len().min(8)],
+                changed.iter().take(4).map(|&i| self.deferred_witness_slots[i]).collect::<Vec<_>>(),
+                changed.iter().take(4).map(|&i| fork.deferred_witness_slots[i]).collect::<Vec<_>>()
+            );
             return Err("fork join: fork changed wires below its base");
         }
         if fork.pending_deferred_constraint_slots != self.pending_deferred_constraint_slots
