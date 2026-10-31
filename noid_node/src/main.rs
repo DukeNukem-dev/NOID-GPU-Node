@@ -860,7 +860,7 @@ const STATE_MANIFEST_CANDIDATE_SETTLE: std::time::Duration = std::time::Duration
 /// so a request queued behind stream capacity otherwise has no node-visible
 /// deadline. Hedge the same exact terminal to one advertised alternate before
 /// that internal queue can stall cold sync.
-const HISTORY_STEP_TERMINAL_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+const HISTORY_STEP_TERMINAL_HEDGE_AFTER: std::time::Duration = std::time::Duration::from_secs(1); // amun: was 3 s
 /// Bound the whole logical race, including time before libp2p opens either
 /// outbound substream. This is deliberately longer than the transport's
 /// 60-second request timeout, plus the hedge offset and timer sweep, so both

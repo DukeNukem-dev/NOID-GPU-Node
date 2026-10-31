@@ -28,11 +28,11 @@ use super::{
 /// failure domain advertises the exact bytes, issue one bounded hedge instead
 /// of waiting behind a producer's serving FIFO. Bodies are at most ~83 KiB;
 /// recursive terminals are roughly one MiB.
-const EXACT_OBJECT_HEDGE_NO_PROGRESS_MS: u64 = 4_000;
+const EXACT_OBJECT_HEDGE_NO_PROGRESS_MS: u64 = 800; // amun: was 4_000
 /// A hedge that has itself produced no complete response for this long may be
 /// replaced once by an exact provider in a third failure domain. The original
 /// primary remains alive, so a slow source is not confused with a dead one.
-const TERMINAL_HEDGE_ROTATE_AFTER_MS: u64 = 8_000;
+const TERMINAL_HEDGE_ROTATE_AFTER_MS: u64 = 2_500; // amun: was 8_000
 /// A deliberately rotated hedge remains a valid late responder, but is not
 /// selected for another request while its original 60-second transport may
 /// still be draining.
