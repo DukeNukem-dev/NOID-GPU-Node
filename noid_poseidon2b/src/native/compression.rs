@@ -278,6 +278,86 @@ pub fn poseidon2b_hash_bytes(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
 /// roots that already have structured byte pieces.
 #[inline]
 pub fn poseidon2b_hash_byte_slices(domain: &[u8], pieces: &[&[u8]]) -> [u8; 32] {
+    let total: usize = pieces.iter().map(|p| p.len()).sum();
+    if total >= hash_memo::MIN_BYTES && hash_memo::enabled() {
+        return hash_memo::get_or_compute(domain, pieces, total, || {
+            poseidon2b_hash_byte_slices_uncached(domain, pieces)
+        });
+    }
+    poseidon2b_hash_byte_slices_uncached(domain, pieces)
+}
+
+/// Exact-key memo for large byte hashes (static layout and verification-key digests).
+mod hash_memo {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    pub const MIN_BYTES: usize = 8 * 1024;
+    const BUDGET_BYTES: usize = 512 << 20;
+
+    struct Memo {
+        map: HashMap<Vec<u8>, [u8; 32]>,
+        bytes: usize,
+    }
+
+    static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("NOID_HASH_MEMO").map_or(true, |v| v != "0"))
+    }
+
+    fn key(domain: &[u8], pieces: &[&[u8]], total: usize) -> Vec<u8> {
+        let mut k = Vec::with_capacity(16 + domain.len() + 8 * pieces.len() + total);
+        k.extend_from_slice(&(domain.len() as u64).to_le_bytes());
+        k.extend_from_slice(domain);
+        k.extend_from_slice(&(pieces.len() as u64).to_le_bytes());
+        for piece in pieces {
+            k.extend_from_slice(&(piece.len() as u64).to_le_bytes());
+            k.extend_from_slice(piece);
+        }
+        k
+    }
+
+    pub fn get_or_compute(
+        domain: &[u8],
+        pieces: &[&[u8]],
+        total: usize,
+        compute: impl FnOnce() -> [u8; 32],
+    ) -> [u8; 32] {
+        let k = key(domain, pieces, total);
+        let memo = MEMO.get_or_init(|| Mutex::new(Memo { map: HashMap::new(), bytes: 0 }));
+        if let Ok(m) = memo.lock() {
+            if let Some(d) = m.map.get(&k) {
+                HITS.fetch_add(1, Ordering::Relaxed);
+                return *d;
+            }
+        }
+        let d = compute();
+        let misses = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if misses <= 400 || misses % 1000 == 0 {
+            eprintln!(
+                "noid-hash-memo: miss #{misses} ({} bytes, hits so far {})",
+                total,
+                HITS.load(Ordering::Relaxed)
+            );
+        }
+        if let Ok(mut m) = memo.lock() {
+            if m.bytes + k.len() > BUDGET_BYTES {
+                m.map.clear();
+                m.bytes = 0;
+            }
+            m.bytes += k.len();
+            m.map.insert(k, d);
+        }
+        d
+    }
+}
+
+fn poseidon2b_hash_byte_slices_uncached(domain: &[u8], pieces: &[&[u8]]) -> [u8; 32] {
     let mut s = Poseidon2bSponge::with_iv(capacity_iv(TAG_BYTEHASH));
     s.update(&(domain.len() as u64).to_le_bytes());
     s.update(domain);
@@ -612,5 +692,24 @@ mod tests {
         for i in 0..4 {
             assert_eq!(flat_to_tower_u128(flat[i]), expected[i].0, "lane {i}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod amun_hash_memo_tests {
+    use super::*;
+
+    #[test]
+    fn memo_returns_the_uncached_digest() {
+        let big: Vec<u8> = (0..20_000u32).map(|i| (i.wrapping_mul(2654435761u32) >> 13) as u8).collect();
+        let a = poseidon2b_hash_byte_slices(b"amun", &[&big[..9000], &big[9000..]]);
+        let b = poseidon2b_hash_byte_slices(b"amun", &[&big[..9000], &big[9000..]]);
+        assert_eq!(a, poseidon2b_hash_byte_slices_uncached(b"amun", &[&big[..9000], &big[9000..]]));
+        assert_eq!(a, b);
+        // same bytes split differently must stay a different input
+        let c = poseidon2b_hash_byte_slices(b"amun", &[&big[..9001], &big[9001..]]);
+        assert_eq!(c, poseidon2b_hash_byte_slices_uncached(b"amun", &[&big[..9001], &big[9001..]]));
+        assert_ne!(a, c);
     }
 }
