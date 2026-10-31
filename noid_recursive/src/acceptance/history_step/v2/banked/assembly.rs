@@ -101,14 +101,21 @@ fn prepare_assembly<const TIER: usize>(
     });
     let (children, parents): (Vec<_>, Vec<_>) =
         scratch.into_iter().map(|s| (s.child, s.parent)).unzip();
-    let columns = prepare_history_step_parent_columns(
-        &mut builder,
-        &r_proofs,
-        selected.index(),
-        &runtime.parts.geometry,
-        children,
-        parents,
-    )?;
+    // amun: witness assembly fork (v2). Sections: A = parent columns, S = parent seal, B = block slots,
+    // P = the pin between B and C, C = arms + parent finalize. A and C only share wires below A with S+B, and
+    // C reads A, so after one sequential assembly per class the work runs as (A then C) || (S + B) on
+    // witness-only forks at the recorded wire offsets, merged in order A, S+B, P, C.
+    let fork_wa = builder.num_wires();
+    let section_a = |builder: &mut FieldR1csBuilder| {
+        prepare_history_step_parent_columns(
+            builder,
+            &r_proofs,
+            selected.index(),
+            &runtime.parts.geometry,
+            children,
+            parents,
+        )
+    };
     let HistoryStepBlockInput {
         start_accumulator,
         end_accumulator,
@@ -118,13 +125,8 @@ fn prepare_assembly<const TIER: usize>(
         parent_header,
         ..
     } = current;
-    let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
-    // amun: the block-slots section (B) and the arms/finalize section (C) only share wires allocated before
-    // this point, so after one sequential assembly per class they are built in parallel on witness-only
-    // forks at the recorded wire offsets and merged in order (B, the pin between them, C).
-    let fork_w0 = builder.num_wires();
     let gate_ref = &gate;
-    let section_c = |builder: &mut FieldR1csBuilder| -> Result<_, V2Error> {
+    let section_c = |builder: &mut FieldR1csBuilder, columns| -> Result<_, V2Error> {
     pin_eq(
         &mut *builder,
         &cells[ORIGIN_ACC],
@@ -247,35 +249,49 @@ fn prepare_assembly<const TIER: usize>(
     })?;
         Ok((prev, parent))
     };
-    let (block, prev, parent) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
-        Some((b_size, pin_size)) => {
-            let start2 = fork_w0 + b_size + pin_size;
-            let mut fb = builder.amun_fork_witness_at(fork_w0).map_err(|e| super::amun_fork::fail(e))?;
-            let mut fc = builder.amun_fork_witness_at(start2).map_err(|e| super::amun_fork::fail(e))?;
-            let (block, c_out) = rayon::join(
+    let (parent_seal, block, prev, parent) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
+        Some((a_size, seal_size, b_size, pin_size)) => {
+            let w_seal = fork_wa + a_size;
+            let w0 = w_seal + seal_size;
+            let start2 = w0 + b_size + pin_size;
+            let mut fa = builder.amun_fork_witness_at(fork_wa).map_err(|e| super::amun_fork::fail(e))?;
+            let mut fs = builder.amun_fork_witness_at(w_seal).map_err(|e| super::amun_fork::fail(e))?;
+            let (left, right) = rayon::join(
+                || -> Result<_, V2Error> {
+                    let columns = section_a(&mut fa)?;
+                    if fa.num_wires() != w_seal {
+                        return Err(super::amun_fork::fail("parent-columns section size changed"));
+                    }
+                    let mut fc = fa.amun_fork_witness_at(start2).map_err(|e| super::amun_fork::fail(e))?;
+                    let (prev, parent) = section_c(&mut fc, columns)?;
+                    Ok((fa, fc, prev, parent))
+                },
                 || {
                     crate::acceptance::trace::with_clean_pin_gates(|| {
-        build_block_slots_selected_zk_prefix(
-                &mut fb,
-            &start_accumulator,
-            &end_accumulator,
-            &components,
-            &sealed_header,
-            TIER,
-            authorization,
-            &parent_header,
-            &parent_seal.block_id,
-            BlockRelationProfile::ScheduledV2(config),
-    )
+                        let parent_seal = ParentSealTrace::alloc(&mut fs, &parent_header);
+                        let block = build_block_slots_selected_zk_prefix(
+                            &mut fs,
+                            &start_accumulator,
+                            &end_accumulator,
+                            &components,
+                            &sealed_header,
+                            TIER,
+                            authorization,
+                            &parent_header,
+                            &parent_seal.block_id,
+                            BlockRelationProfile::ScheduledV2(config),
+                        );
+                        (fs, parent_seal, block)
                     })
                 },
-                || section_c(&mut fc),
             );
-            let (prev, parent) = c_out?;
-            if fb.num_wires() != fork_w0 + b_size {
-                return Err(super::amun_fork::fail("block-slots section size changed"));
+            let (fa, fc, prev, parent) = left?;
+            let (fs, parent_seal, block) = right;
+            if fs.num_wires() != w0 + b_size {
+                return Err(super::amun_fork::fail("seal/block-slots section size changed"));
             }
-            builder.amun_join_witness(fb, fork_w0).map_err(|e| super::amun_fork::fail(e))?;
+            builder.amun_join_witness(fa, fork_wa).map_err(|e| super::amun_fork::fail(e))?;
+            builder.amun_join_witness(fs, w_seal).map_err(|e| super::amun_fork::fail(e))?;
             pin_eq(
                 &mut builder,
                 &parent_seal.height,
@@ -285,21 +301,25 @@ fn prepare_assembly<const TIER: usize>(
                 return Err(super::amun_fork::fail("pin section size changed"));
             }
             builder.amun_join_witness(fc, start2).map_err(|e| super::amun_fork::fail(e))?;
-            (block, prev, parent)
+            (parent_seal, block, prev, parent)
         }
         None => {
-        let block = build_block_slots_selected_zk_prefix(
-            &mut builder,
-            &start_accumulator,
-            &end_accumulator,
-            &components,
-            &sealed_header,
-            TIER,
-            authorization,
-            &parent_header,
-            &parent_seal.block_id,
-            BlockRelationProfile::ScheduledV2(config),
-        );
+            let columns = section_a(&mut builder)?;
+            let a_end = builder.num_wires();
+            let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
+            let seal_end = builder.num_wires();
+            let block = build_block_slots_selected_zk_prefix(
+                &mut builder,
+                &start_accumulator,
+                &end_accumulator,
+                &components,
+                &sealed_header,
+                TIER,
+                authorization,
+                &parent_header,
+                &parent_seal.block_id,
+                BlockRelationProfile::ScheduledV2(config),
+            );
             let b_end = builder.num_wires();
             pin_eq(
                 &mut builder,
@@ -307,9 +327,14 @@ fn prepare_assembly<const TIER: usize>(
                 &block.slots().start_acc.height,
             );
             let pin_end = builder.num_wires();
-            let (prev, parent) = section_c(&mut builder)?;
-            super::amun_fork::record(class.wire_id(), TIER, frozen, b_end - fork_w0, pin_end - b_end);
-            (block, prev, parent)
+            let (prev, parent) = section_c(&mut builder, columns)?;
+            super::amun_fork::record(
+                class.wire_id(),
+                TIER,
+                frozen,
+                (a_end - fork_wa, seal_end - a_end, b_end - seal_end, pin_end - b_end),
+            );
+            (parent_seal, block, prev, parent)
         }
     };
     for lane in 0..2 {
