@@ -51,8 +51,13 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
             let prior_io = runtime
                 .bank
                 .initial_io(origin, Class::Small, &origin.boundary);
-            let (small, small_scratch) = shape_only_arm(runtime, Class::Small, prior_io.clone())?;
-            let (large, large_scratch) = shape_only_arm(runtime, Class::Large, prior_io)?;
+            // amun: the two shape-only arms are independent; build them in parallel (same results).
+            let (small_arm, large_arm) = rayon::join(
+                || shape_only_arm(runtime, Class::Small, prior_io.clone()),
+                || shape_only_arm(runtime, Class::Large, prior_io.clone()),
+            );
+            let (small, small_scratch) = small_arm?;
+            let (large, large_scratch) = large_arm?;
             Ok(PreparedParent {
                 selected: Class::Small,
                 current: current_class,
@@ -73,12 +78,18 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
                 return Err(V2Error::Boundary);
             }
             let selected = parsed.class;
-            let (fresh, scratch) = replay(runtime, selected, &parent.proof)?;
             let other = match selected {
                 Class::Small => Class::Large,
                 Class::Large => Class::Small,
             };
-            let (ghost, ghost_scratch) = shape_only_arm(runtime, other, parent.proof.io.clone())?;
+            // amun: the selected-class replay and the other class's shape-only arm are independent;
+            // run them in parallel (same results, errors checked in the original order).
+            let (replayed, ghost_arm) = rayon::join(
+                || replay(runtime, selected, &parent.proof),
+                || shape_only_arm(runtime, other, parent.proof.io.clone()),
+            );
+            let (fresh, scratch) = replayed?;
+            let (ghost, ghost_scratch) = ghost_arm?;
             let incoming = parsed.claims[selected.index()].clone().unwrap_or_else(|| {
                 C1MatrixAccClaim::zero(runtime.bank.config().class(selected).outer_m())
             });
