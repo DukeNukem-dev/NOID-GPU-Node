@@ -714,6 +714,11 @@ impl Default for ExternalMiningAttemptInvalidator {
     }
 }
 
+fn amun_template_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NOID_TEMPLATE_TRACE").is_ok_and(|v| v != "0"))
+}
+
 fn shadow_verify_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NOID_SHADOW_VERIFY").map_or(true, |v| v != "0"))
@@ -1383,6 +1388,7 @@ impl RpcHandler {
             .unwrap_or_default()
             .as_secs();
 
+        let amun_t0 = Instant::now();
         let builder = TemplateBuilder::new(self.mempool.clone()).with_history_protocol(
             self.history_step_runtime
                 .as_deref()
@@ -1392,8 +1398,11 @@ impl RpcHandler {
         // chain, mempool and wallet views. Capture the exact parent+payout
         // boundary under that gate, then release it before witness preparation.
         let wallet_operation = self.wallet_operation_gate.lock().await;
+        let amun_t_gate = amun_t0.elapsed();
         let (snapshot, addr) = {
             let mut ctx = self.chain.write().await;
+            let amun_t_lock = amun_t0.elapsed();
+            let _ = &amun_t_lock;
             let operator_payout = self.resolved_mining_payout()?;
             let addr = match requested {
                 None => operator_payout,
@@ -1410,9 +1419,18 @@ impl RpcHandler {
             };
             let snapshot = TemplateChainSnapshot::from_context(&mut ctx)
                 .map_err(|e| rpc_err(format!("template snapshot: {e:?}")))?;
+            if amun_template_trace() {
+                eprintln!(
+                    "amun template: gate {:.1} ms, chain lock {:.1} ms, snapshot {:.1} ms",
+                    amun_t_gate.as_secs_f64() * 1e3,
+                    (amun_t_lock - amun_t_gate).as_secs_f64() * 1e3,
+                    (amun_t0.elapsed() - amun_t_lock).as_secs_f64() * 1e3
+                );
+            }
             (snapshot, addr)
         };
         drop(wallet_operation);
+        let amun_t_build = Instant::now();
         let max_effective_pages = self
             .external_mining_capacity
             .lock()
@@ -1422,6 +1440,13 @@ impl RpcHandler {
             .build_from_snapshot_with_limit(snapshot, addr, now, max_effective_pages)
             .await
             .ok_or_else(|| rpc_err("template build failed"))?;
+        if amun_template_trace() {
+            eprintln!(
+                "amun template: build {:.1} ms, total before proving {:.1} ms",
+                amun_t_build.elapsed().as_secs_f64() * 1e3,
+                amun_t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
 
         let height = tmpl.inner.height;
         let n_txs = tmpl.inner.n_txs();
