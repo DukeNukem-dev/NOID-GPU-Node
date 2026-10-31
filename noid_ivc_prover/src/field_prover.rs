@@ -565,8 +565,13 @@ where
     assert_eq!(witness.len(), 1usize << shape.m);
     assert_eq!(pcs_params.m, shape.m + pcs::LOG_PACKING);
 
-    let (commitment, prover_data) = pcs::commit(witness, pcs_params);
-    lap("PCS commit", &mut phase);
+    // amun: A·z and B·z depend only on the relation and the witness; compute them on the CPU while the
+    // PCS commit runs (mostly on the GPU), instead of after the post-commit auxiliary proofs.
+    let ((commitment, prover_data), (a, b)) = rayon::join(
+        || pcs::commit(witness, pcs_params),
+        || (r1cs.apply_a_relation(witness), r1cs.apply_b_relation(witness)),
+    );
+    lap("PCS commit (+ apply A/B)", &mut phase);
     check_cancelled()?;
     bind_statement_field_parts_c1(challenger, &r1cs.field_statement_digest(), &commitment);
 
@@ -584,10 +589,6 @@ where
     lap("post-commit auxiliary", &mut phase);
     check_cancelled()?;
 
-    let a = r1cs.apply_a_relation(witness);
-    let b = r1cs.apply_b_relation(witness);
-    lap("apply A/B", &mut phase);
-    check_cancelled()?;
     let (zerocheck_proof, zerocheck_claim) =
         zerocheck::field_c1::prove(&a, &b, witness, shape.m, challenger);
     drop(a);
