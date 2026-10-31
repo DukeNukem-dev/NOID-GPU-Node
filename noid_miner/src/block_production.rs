@@ -591,7 +591,11 @@ impl PreparedBlockAttempt {
     /// amun/proving: inputs for verifying this attempt's terminal like an imported block
     /// (terminal bytes, block header, tx-epoch anchor header).
     pub fn shadow_verify_inputs(&self) -> (Vec<u8>, noid_chain::BlockHeader, noid_chain::BlockHeader) {
-        (self.terminal_bytes.clone(), self.block.header, self.epoch_anchor_header)
+        // The new block's child binds the anchor at (height-1)/144*144. On the first block of a
+        // tx epoch that is the parent itself, not the parent's own anchor.
+        let want = noid_chain::consensus::tx_epoch_anchor_height_for_child(self.block.header.height);
+        let epoch = if want == self.parent_header.height { self.parent_header } else { self.epoch_anchor_header };
+        (self.terminal_bytes.clone(), self.block.header, epoch)
     }
 
     pub const fn retained_bytes(&self) -> usize {
