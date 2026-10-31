@@ -429,6 +429,27 @@ struct CachedExternalMiningTemplate<T> {
     parent_height: u64,
     parent_id: [u8; 32],
     expires_at: Instant,
+    /// amun/proving: when this template became Ready (successor refresh timing).
+    installed_at: Instant,
+}
+
+/// amun/proving M12: a same-parent replacement prepared while the Ready template stays live.
+struct SuccessorPreparation {
+    template_id: ExternalMiningTemplateId,
+    invalidated: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Start a successor once the Ready template is this old (NOID_TEMPLATE_REFRESH seconds, 0 = off).
+fn successor_refresh_after() -> Option<Duration> {
+    static R: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        let secs = std::env::var("NOID_TEMPLATE_REFRESH")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        (secs > 0).then(|| Duration::from_secs(secs))
+    })
 }
 
 enum ExternalMiningAttemptState<T> {
@@ -452,6 +473,8 @@ struct ExternalMiningAttemptSlot<T> {
     state: ExternalMiningAttemptState<T>,
     namespace: u64,
     next_sequence: u64,
+    successor: Option<SuccessorPreparation>,
+    refresh_after: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +489,8 @@ impl<T> ExternalMiningAttemptSlot<T> {
             state: ExternalMiningAttemptState::Idle,
             namespace,
             next_sequence: 0,
+            successor: None,
+            refresh_after: None,
         }
     }
 
@@ -479,15 +504,38 @@ impl<T> ExternalMiningAttemptSlot<T> {
         }
     }
 
-    fn reserve_preparation(&mut self, now: Instant) -> Result<ExternalMiningTemplateId, String> {
-        self.purge_expired(now);
-        if !matches!(self.state, ExternalMiningAttemptState::Idle) {
-            return Err("external mining attempt is already active".to_string());
-        }
+    fn next_template_id(&mut self) -> ExternalMiningTemplateId {
         self.next_sequence = self.next_sequence.wrapping_add(1);
         let mut template_id = [0u8; 16];
         template_id[..8].copy_from_slice(&self.namespace.to_le_bytes());
         template_id[8..].copy_from_slice(&self.next_sequence.to_le_bytes());
+        template_id
+    }
+
+    fn reserve_preparation(&mut self, now: Instant) -> Result<ExternalMiningTemplateId, String> {
+        self.purge_expired(now);
+        if self.successor.is_some() {
+            return Err("external mining attempt is already active".to_string());
+        }
+        if let ExternalMiningAttemptState::Ready(cached) = &self.state {
+            let due = self
+                .refresh_after
+                .is_some_and(|after| now.saturating_duration_since(cached.installed_at) >= after);
+            if !due {
+                return Err("external mining attempt is already active".to_string());
+            }
+            let template_id = self.next_template_id();
+            self.successor = Some(SuccessorPreparation {
+                template_id,
+                invalidated: false,
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+            return Ok(template_id);
+        }
+        if !matches!(self.state, ExternalMiningAttemptState::Idle) {
+            return Err("external mining attempt is already active".to_string());
+        }
+        let template_id = self.next_template_id();
         self.state = ExternalMiningAttemptState::Preparing {
             template_id,
             invalidated: false,
@@ -497,6 +545,9 @@ impl<T> ExternalMiningAttemptSlot<T> {
     }
 
     fn preparation_cancel_flag(&self, template_id: ExternalMiningTemplateId) -> Option<Arc<AtomicBool>> {
+        if let Some(next) = self.successor.as_ref().filter(|n| n.template_id == template_id) {
+            return Some(next.cancel.clone());
+        }
         match &self.state {
             ExternalMiningAttemptState::Preparing { template_id: active, cancel, .. }
                 if *active == template_id => Some(cancel.clone()),
@@ -505,6 +556,10 @@ impl<T> ExternalMiningAttemptSlot<T> {
     }
 
     fn cancel_preparation(&mut self, template_id: ExternalMiningTemplateId) {
+        if self.successor.as_ref().is_some_and(|n| n.template_id == template_id) {
+            self.successor = None;
+            return;
+        }
         if matches!(
             &self.state,
             ExternalMiningAttemptState::Preparing {
@@ -524,6 +579,23 @@ impl<T> ExternalMiningAttemptSlot<T> {
         parent_id: [u8; 32],
         expires_at: Instant,
     ) -> Result<(), String> {
+        if let Some(next) = self.successor.as_ref().filter(|n| n.template_id == template_id) {
+            let valid = !next.invalidated
+                && matches!(self.state, ExternalMiningAttemptState::Ready(_) | ExternalMiningAttemptState::Idle);
+            self.successor = None;
+            if !valid {
+                return Err("external mining preparation was invalidated".to_string());
+            }
+            self.state = ExternalMiningAttemptState::Ready(CachedExternalMiningTemplate {
+                prepared,
+                template_id,
+                parent_height,
+                parent_id,
+                expires_at,
+                installed_at: Instant::now(),
+            });
+            return Ok(());
+        }
         let installable = matches!(
             &self.state,
             ExternalMiningAttemptState::Preparing {
@@ -542,6 +614,7 @@ impl<T> ExternalMiningAttemptSlot<T> {
             parent_height,
             parent_id,
             expires_at,
+            installed_at: Instant::now(),
         });
         Ok(())
     }
@@ -572,6 +645,11 @@ impl<T> ExternalMiningAttemptSlot<T> {
                     && cached.parent_id == tip_id =>
             {
                 self.state = ExternalMiningAttemptState::Proving { template_id };
+                // A block is being submitted on this parent: the successor would be stale.
+                if let Some(next) = self.successor.as_mut() {
+                    next.invalidated = true;
+                    next.cancel.store(true, Ordering::Release);
+                }
                 Ok(cached.prepared)
             }
             ExternalMiningAttemptState::Ready(cached) if cached.template_id == template_id => {
@@ -597,6 +675,10 @@ impl<T> ExternalMiningAttemptSlot<T> {
     }
 
     fn invalidate_except(&mut self, tip_height: u64, tip_id: [u8; 32]) {
+        if let Some(next) = self.successor.as_mut() {
+            next.invalidated = true;
+            next.cancel.store(true, Ordering::Release);
+        }
         match &mut self.state {
             ExternalMiningAttemptState::Idle => {}
             ExternalMiningAttemptState::Preparing { invalidated, cancel, .. } => {
@@ -640,9 +722,11 @@ fn shadow_verify_enabled() -> bool {
 impl ExternalMiningAttemptInvalidator {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ExternalMiningAttemptSlot::new(
-                node_entropy_nonce(),
-            ))),
+            inner: Arc::new(Mutex::new({
+                let mut slot = ExternalMiningAttemptSlot::new(node_entropy_nonce());
+                slot.refresh_after = successor_refresh_after();
+                slot
+            })),
         }
     }
 
@@ -3276,6 +3360,53 @@ mod tests {
 
         assert_eq!(queries, 20);
         assert_eq!(next_index, 21);
+    }
+
+    #[test]
+    fn successor_refresh_lifecycle() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(11);
+        let mut slot = ExternalMiningAttemptSlot::<u32>::new(7);
+        slot.refresh_after = Some(Duration::from_secs(10));
+        let first = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(first, 1, 7, [7u8; 32], now + Duration::from_secs(75)).unwrap();
+        // too early for a successor
+        assert!(slot.reserve_preparation(now).is_err());
+        // installed_at is Instant::now() inside install_ready; use a clearly later time
+        let succ = slot.reserve_preparation(Instant::now() + Duration::from_secs(11)).unwrap();
+        assert_ne!(succ, first);
+        // only one successor at a time; the Ready template stays minable
+        assert!(slot.reserve_preparation(later + Duration::from_secs(60)).is_err());
+        assert!(slot.preparation_cancel_flag(succ).is_some());
+        slot.install_ready(succ, 2, 7, [7u8; 32], now + Duration::from_secs(150)).unwrap();
+        // old template id is gone, successor is the Ready one
+        assert_eq!(slot.begin_proving(first, now, 7, [7u8; 32]), Err(ExternalMiningConsumeError::Unavailable));
+        assert_eq!(slot.begin_proving(succ, now, 7, [7u8; 32]), Ok(2));
+        slot.finish_proving(succ);
+        // tip change invalidates and cancels a running successor
+        let a = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(a, 3, 7, [7u8; 32], now + Duration::from_secs(75)).unwrap();
+        let b = slot.reserve_preparation(Instant::now() + Duration::from_secs(11)).unwrap();
+        let flag = slot.preparation_cancel_flag(b).unwrap();
+        slot.invalidate_except(8, [8u8; 32]);
+        assert!(flag.load(Ordering::Acquire));
+        assert!(slot.install_ready(b, 4, 7, [7u8; 32], now + Duration::from_secs(75)).is_err());
+        assert!(slot.reserve_preparation(now).is_ok());
+        // a block submit on the Ready template cancels the successor
+        let mut slot = ExternalMiningAttemptSlot::<u32>::new(9);
+        slot.refresh_after = Some(Duration::from_secs(10));
+        let c = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(c, 5, 7, [7u8; 32], now + Duration::from_secs(75)).unwrap();
+        let d = slot.reserve_preparation(Instant::now() + Duration::from_secs(11)).unwrap();
+        let flag = slot.preparation_cancel_flag(d).unwrap();
+        assert_eq!(slot.begin_proving(c, now, 7, [7u8; 32]), Ok(5));
+        assert!(flag.load(Ordering::Acquire));
+        assert!(slot.install_ready(d, 6, 7, [7u8; 32], now + Duration::from_secs(75)).is_err());
+        // refresh off: never a successor
+        let mut slot = ExternalMiningAttemptSlot::<u32>::new(10);
+        let e = slot.reserve_preparation(now).unwrap();
+        slot.install_ready(e, 7, 7, [7u8; 32], now + Duration::from_secs(75)).unwrap();
+        assert!(slot.reserve_preparation(Instant::now() + Duration::from_secs(60)).is_err());
     }
 
     #[test]
