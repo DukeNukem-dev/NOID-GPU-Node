@@ -380,6 +380,8 @@ pub struct FieldR1csBuilder {
     /// and the parent's pending deferred-witness count at that time.
     amun_fork_base: usize,
     amun_fork_pending0: usize,
+    /// Parent's deferred-constraint count and patch-array lengths when the fork was taken.
+    amun_fork_constraint0: (usize, usize, usize, usize),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -534,6 +536,7 @@ impl FieldR1csBuilder {
             boolean_pin_stats: BooleanPinObservation::default(),
             amun_fork_base: 0,
             amun_fork_pending0: 0,
+            amun_fork_constraint0: (0, 0, 0, 0),
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
         let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
@@ -894,6 +897,12 @@ impl FieldR1csBuilder {
             boolean_pin_stats: self.boolean_pin_stats,
             amun_fork_base: self.values.len(),
             amun_fork_pending0: self.pending_deferred_witness_slots,
+            amun_fork_constraint0: (
+                self.pending_deferred_constraint_slots,
+                self.deferred_constraint_patches.len(),
+                self.deferred_patch_a_cols.len(),
+                self.deferred_patch_b_cols.len(),
+            ),
         })
     }
 
@@ -905,33 +914,59 @@ impl FieldR1csBuilder {
         if self.values.len() != start || fork.values.len() < start || base > start || base > self.values.len() {
             return Err("fork join: wire count mismatch");
         }
-        if fork.values[..base] != self.values[..base] || fork.deferred_witness_slots[..base] != self.deferred_witness_slots[..base] {
-            let changed: Vec<usize> = (0..base)
-                .filter(|&i| fork.values[i] != self.values[i] || fork.deferred_witness_slots[i] != self.deferred_witness_slots[i])
-                .collect();
-            eprintln!(
-                "amun fork: join at {start} (base {base}): {} wires below the base changed, first {:?}, flags parent {:?} fork {:?}",
-                changed.len(),
-                &changed[..changed.len().min(8)],
-                changed.iter().take(4).map(|&i| self.deferred_witness_slots[i]).collect::<Vec<_>>(),
-                changed.iter().take(4).map(|&i| fork.deferred_witness_slots[i]).collect::<Vec<_>>()
-            );
-            return Err("fork join: fork changed wires below its base");
+        // Below its base a fork may only seal deferred slots that were pending there (clear pending bits,
+        // and set the sealed value of a deferred witness slot); deferred-constraint bookkeeping is taken
+        // over only if nothing else changed it since the fork was taken.
+        let current = (
+            self.pending_deferred_constraint_slots,
+            self.deferred_constraint_patches.len(),
+            self.deferred_patch_a_cols.len(),
+            self.deferred_patch_b_cols.len(),
+        );
+        let mut sealed_below = Vec::new();
+        for i in 0..base {
+            let (pf, ff) = (self.deferred_witness_slots[i], fork.deferred_witness_slots[i]);
+            if pf == ff && fork.values[i] == self.values[i] {
+                continue;
+            }
+            let clears_only = ff & !pf == 0 && ff != pf;
+            let value_ok = fork.values[i] == self.values[i] || pf & PENDING_WITNESS_VALUE != 0;
+            if !clears_only || !value_ok {
+                eprintln!("amun fork: join at {start}: wire {i} changed below the base (flags {pf} -> {ff})");
+                return Err("fork join: fork changed wires below its base");
+            }
+            sealed_below.push(i);
         }
-        if fork.pending_deferred_constraint_slots != self.pending_deferred_constraint_slots
-            || fork.deferred_constraint_patches.len() != self.deferred_constraint_patches.len()
-            || fork.deferred_patch_a_cols.len() != self.deferred_patch_a_cols.len()
-            || fork.deferred_patch_b_cols.len() != self.deferred_patch_b_cols.len()
-        {
-            return Err("fork join: deferred constraint state changed in the fork");
+        let fork_now = (
+            fork.pending_deferred_constraint_slots,
+            fork.deferred_constraint_patches.len(),
+            fork.deferred_patch_a_cols.len(),
+            fork.deferred_patch_b_cols.len(),
+        );
+        let fork_constraint_changed = fork_now != fork.amun_fork_constraint0;
+        if fork_constraint_changed && current != fork.amun_fork_constraint0 {
+            return Err("fork join: deferred constraint state changed in two places");
         }
-        // Deferred witness slots allocated (and possibly still pending) inside the fork carry over.
-        if fork.pending_deferred_witness_slots < fork.amun_fork_pending0 {
-            return Err("fork join: fork sealed deferred slots it did not allocate");
+        let witness_delta = fork.pending_deferred_witness_slots as isize - fork.amun_fork_pending0 as isize;
+        let pending = self.pending_deferred_witness_slots as isize + witness_delta;
+        if pending < 0 {
+            return Err("fork join: negative pending deferred witness count");
+        }
+        for &i in &sealed_below {
+            self.deferred_witness_slots[i] = fork.deferred_witness_slots[i];
+            self.values[i] = fork.values[i];
         }
         self.values.extend_from_slice(&fork.values[start..]);
         self.deferred_witness_slots.extend_from_slice(&fork.deferred_witness_slots[start..]);
-        self.pending_deferred_witness_slots += fork.pending_deferred_witness_slots - fork.amun_fork_pending0;
+        self.pending_deferred_witness_slots = pending as usize;
+        if fork_constraint_changed {
+            self.pending_deferred_constraint_slots = fork.pending_deferred_constraint_slots;
+            self.deferred_constraint_patches = fork.deferred_constraint_patches;
+            self.deferred_patch_a_cols = fork.deferred_patch_a_cols;
+            self.deferred_patch_a_value_indices = fork.deferred_patch_a_value_indices;
+            self.deferred_patch_b_cols = fork.deferred_patch_b_cols;
+            self.deferred_patch_b_value_indices = fork.deferred_patch_b_value_indices;
+        }
         self.publics.extend(fork.publics);
         for (key, bits) in fork.tower_bit_wires {
             self.tower_bit_wires.entry(key).or_insert(bits);
