@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-static PLANS: Mutex<Option<HashMap<(u8, usize), (usize, usize, usize, usize)>>> = Mutex::new(None);
+static PLANS: Mutex<Option<HashMap<(u8, usize), (usize, usize, usize, usize, usize, usize, usize)>>> = Mutex::new(None);
 static DISABLED: AtomicBool = AtomicBool::new(false);
 
 fn enabled() -> bool {
@@ -21,14 +21,14 @@ pub(super) fn trace() -> bool {
     *ON.get_or_init(|| std::env::var("NOID_FORK_TRACE").is_ok_and(|v| v != "0"))
 }
 
-pub(super) fn plan(class: u8, tier: usize, frozen: bool) -> Option<(usize, usize, usize, usize)> {
+pub(super) fn plan(class: u8, tier: usize, frozen: bool) -> Option<(usize, usize, usize, usize, usize, usize, usize)> {
     if frozen || !enabled() {
         return None;
     }
     PLANS.lock().ok()?.as_ref()?.get(&(class, tier)).copied()
 }
 
-pub(super) fn record(class: u8, tier: usize, frozen: bool, sizes: (usize, usize, usize, usize)) {
+pub(super) fn record(class: u8, tier: usize, frozen: bool, sizes: (usize, usize, usize, usize, usize, usize, usize)) {
     if frozen {
         return;
     }
@@ -36,8 +36,8 @@ pub(super) fn record(class: u8, tier: usize, frozen: bool, sizes: (usize, usize,
         let map = g.get_or_insert_with(HashMap::new);
         if map.insert((class, tier), sizes).is_none() {
             eprintln!(
-                "amun fork: plan for class {class} tier {tier}: parent columns {} wires, seal {}, block slots {}, pin {}",
-                sizes.0, sizes.1, sizes.2, sizes.3
+                "amun fork: plan for class {class} tier {tier}: parent columns {} wires, seal {}, block slots {}, pin {}, pre-arms {}, arm0 {}, arm1 {}",
+                sizes.0, sizes.1, sizes.2, sizes.3, sizes.4, sizes.5, sizes.6
             );
         }
     }

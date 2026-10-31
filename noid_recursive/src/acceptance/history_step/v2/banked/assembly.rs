@@ -126,8 +126,7 @@ fn prepare_assembly<const TIER: usize>(
         ..
     } = current;
     let gate_ref = &gate;
-    let section_c = |builder: &mut FieldR1csBuilder, columns| -> Result<_, V2Error> {
-        let amun_tc = std::time::Instant::now();
+    let c_pre = |builder: &mut FieldR1csBuilder| {
     pin_eq(
         &mut *builder,
         &cells[ORIGIN_ACC],
@@ -150,14 +149,14 @@ fn prepare_assembly<const TIER: usize>(
     for index in BANK..POINT {
         pin_eq(&mut *builder, &cells[index], &prev[index]);
     }
-    let mut obligations = Vec::new();
-    let mut recorded_children = Vec::new();
-    let mut recorded_parents = Vec::new();
-    if super::amun_fork::trace() {
-        eprintln!("amun fork trace: C pre-arms {:.0} ms", amun_tc.elapsed().as_secs_f64() * 1e3);
-    }
-    for arm in Class::ALL {
-        let amun_tarm = std::time::Instant::now();
+        (roots, prev, selectors)
+    };
+    let c_arm = |builder: &mut FieldR1csBuilder,
+                 arm: Class,
+                 roots: &[_],
+                 prev: &[LinExpr],
+                 selectors: &[LinExpr]|
+     -> Result<_, V2Error> {
         let slot = arm.index();
         let entry = runtime.bank.config().class(arm);
         let envelope = envelopes[slot].proof();
@@ -207,9 +206,8 @@ fn prepare_assembly<const TIER: usize>(
         if let Some(error) = error {
             return Err(error.into());
         }
-        obligations.push(arm_obligations);
-        recorded_children.push(child.ok_or(V2Error::Layout)?);
-        recorded_parents.push(recorder.finish());
+        let amun_child = child.ok_or(V2Error::Layout)?;
+        let amun_parent = recorder.finish();
         let lane = Lane::for_class(arm);
         let incoming = C1MatrixAccClaimTrace {
             point: prev[lane.point..lane.value]
@@ -241,47 +239,58 @@ fn prepare_assembly<const TIER: usize>(
                 pin_eq(&mut *builder, cell, &LinExpr::zero());
             }
         });
-        if super::amun_fork::trace() {
-            eprintln!("amun fork trace: C arm {slot} {:.0} ms ({} wires so far)", amun_tarm.elapsed().as_secs_f64() * 1e3, builder.num_wires());
-        }
-    }
-    let amun_tfin = std::time::Instant::now();
+        Ok((arm_obligations, amun_child, amun_parent))
+    };
+    let c_fin = |builder: &mut FieldR1csBuilder,
+                 columns,
+                 obligations: &[_],
+                 selectors: &[LinExpr],
+                 recorded_children: &[_],
+                 recorded_parents: &[_]|
+     -> Result<_, V2Error> {
     let parent = with_pin_gate(gate_ref, || {
         finalize_history_step_parent_region(
             &mut *builder,
             columns,
-            &obligations,
-            &selectors,
-            &recorded_children,
-            &recorded_parents,
+            obligations,
+            selectors,
+            recorded_children,
+            recorded_parents,
         )
     })?;
-        if super::amun_fork::trace() {
-            eprintln!("amun fork trace: C finalize {:.0} ms", amun_tfin.elapsed().as_secs_f64() * 1e3);
-        }
-        Ok((prev, parent))
+        Ok(parent)
     };
     let (parent_seal, block, prev, parent) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
-        Some((a_size, seal_size, b_size, pin_size)) => {
+        Some((a_size, seal_size, b_size, pin_size, pre_size, arm0_size, arm1_size)) => {
             let w_seal = fork_wa + a_size;
             let w0 = w_seal + seal_size;
             let start2 = w0 + b_size + pin_size;
+            let w_arm1 = start2 + pre_size + arm0_size;
             let mut fa = builder.amun_fork_witness_at(fork_wa).map_err(|e| super::amun_fork::fail(e))?;
             let mut fs = builder.amun_fork_witness_at(w_seal).map_err(|e| super::amun_fork::fail(e))?;
+            let mut fc0 = builder.amun_fork_witness_at(start2).map_err(|e| super::amun_fork::fail(e))?;
+            // The pre-arm part is tiny and both arms need it: run it first, then fork arm 1 from it.
+            let (roots, prev, selectors) = c_pre(&mut fc0);
+            if fc0.num_wires() != start2 + pre_size {
+                return Err(super::amun_fork::fail("pre-arm section size changed"));
+            }
+            let mut fc1 = fc0.amun_fork_witness_at(w_arm1).map_err(|e| super::amun_fork::fail(e))?;
             let amun_t = std::time::Instant::now();
-            let (left, right) = rayon::join(
-                || -> Result<_, V2Error> {
-                    let columns = section_a(&mut fa)?;
-                    let amun_ta = amun_t.elapsed();
-                    if fa.num_wires() != w_seal {
-                        return Err(super::amun_fork::fail("parent-columns section size changed"));
-                    }
-                    let mut fc = fa.amun_fork_witness_at(start2).map_err(|e| super::amun_fork::fail(e))?;
-                    let (prev, parent) = section_c(&mut fc, columns)?;
-                    if super::amun_fork::trace() {
-                        eprintln!("amun fork trace: A {:.0} ms, A+C {:.0} ms", amun_ta.as_secs_f64() * 1e3, amun_t.elapsed().as_secs_f64() * 1e3);
-                    }
-                    Ok((fa, fc, prev, parent))
+            let ((columns, arms), seal_block) = rayon::join(
+                || {
+                    rayon::join(
+                        || section_a(&mut fa),
+                        || {
+                            rayon::join(
+                                || c_arm(&mut fc0, Class::ALL[0], &roots, &prev, &selectors),
+                                || {
+                                    crate::acceptance::trace::with_clean_pin_gates(|| {
+                                        c_arm(&mut fc1, Class::ALL[1], &roots, &prev, &selectors)
+                                    })
+                                },
+                            )
+                        },
+                    )
                 },
                 || {
                     crate::acceptance::trace::with_clean_pin_gates(|| {
@@ -298,17 +307,24 @@ fn prepare_assembly<const TIER: usize>(
                             &parent_seal.block_id,
                             BlockRelationProfile::ScheduledV2(config),
                         );
-                        if super::amun_fork::trace() {
-                            eprintln!("amun fork trace: S+B {:.0} ms", amun_t.elapsed().as_secs_f64() * 1e3);
-                        }
-                        (fs, parent_seal, block)
+                        (parent_seal, block)
                     })
                 },
             );
-            let (fa, fc, prev, parent) = left?;
-            let (fs, parent_seal, block) = right;
-            if fs.num_wires() != w0 + b_size {
-                return Err(super::amun_fork::fail("seal/block-slots section size changed"));
+            if super::amun_fork::trace() {
+                eprintln!("amun fork trace: parallel part {:.0} ms", amun_t.elapsed().as_secs_f64() * 1e3);
+            }
+            let columns = columns?;
+            let (arm0, arm1) = arms;
+            let (o0, c0, p0) = arm0?;
+            let (o1, c1, p1) = arm1?;
+            let (parent_seal, block) = seal_block;
+            if fa.num_wires() != w_seal
+                || fs.num_wires() != w0 + b_size
+                || fc0.num_wires() != w_arm1
+                || fc1.num_wires() != w_arm1 + arm1_size
+            {
+                return Err(super::amun_fork::fail("a forked section changed size"));
             }
             builder.amun_join_witness(fa, fork_wa).map_err(|e| super::amun_fork::fail(e))?;
             builder.amun_join_witness(fs, w_seal).map_err(|e| super::amun_fork::fail(e))?;
@@ -320,7 +336,9 @@ fn prepare_assembly<const TIER: usize>(
             if builder.num_wires() != start2 {
                 return Err(super::amun_fork::fail("pin section size changed"));
             }
-            builder.amun_join_witness(fc, start2).map_err(|e| super::amun_fork::fail(e))?;
+            builder.amun_join_witness(fc0, start2).map_err(|e| super::amun_fork::fail(e))?;
+            builder.amun_join_witness(fc1, w_arm1).map_err(|e| super::amun_fork::fail(e))?;
+            let parent = c_fin(&mut builder, columns, &[o0, o1], &selectors, &[c0, c1], &[p0, p1])?;
             (parent_seal, block, prev, parent)
         }
         None => {
@@ -329,17 +347,17 @@ fn prepare_assembly<const TIER: usize>(
             let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
             let seal_end = builder.num_wires();
             let block = build_block_slots_selected_zk_prefix(
-                &mut builder,
-                &start_accumulator,
-                &end_accumulator,
-                &components,
-                &sealed_header,
-                TIER,
-                authorization,
-                &parent_header,
-                &parent_seal.block_id,
-                BlockRelationProfile::ScheduledV2(config),
-            );
+                            &mut builder,
+                            &start_accumulator,
+                            &end_accumulator,
+                            &components,
+                            &sealed_header,
+                            TIER,
+                            authorization,
+                            &parent_header,
+                            &parent_seal.block_id,
+                            BlockRelationProfile::ScheduledV2(config),
+                        );
             let b_end = builder.num_wires();
             pin_eq(
                 &mut builder,
@@ -347,12 +365,33 @@ fn prepare_assembly<const TIER: usize>(
                 &block.slots().start_acc.height,
             );
             let pin_end = builder.num_wires();
-            let (prev, parent) = section_c(&mut builder, columns)?;
+            let (roots, prev, selectors) = c_pre(&mut builder);
+            let pre_end = builder.num_wires();
+            let mut obligations = Vec::new();
+            let mut recorded_children = Vec::new();
+            let mut recorded_parents = Vec::new();
+            let mut arm_ends = Vec::new();
+            for arm in Class::ALL {
+                let (o, c, p) = c_arm(&mut builder, arm, &roots, &prev, &selectors)?;
+                obligations.push(o);
+                recorded_children.push(c);
+                recorded_parents.push(p);
+                arm_ends.push(builder.num_wires());
+            }
+            let parent = c_fin(&mut builder, columns, &obligations, &selectors, &recorded_children, &recorded_parents)?;
             super::amun_fork::record(
                 class.wire_id(),
                 TIER,
                 frozen,
-                (a_end - fork_wa, seal_end - a_end, b_end - seal_end, pin_end - b_end),
+                (
+                    a_end - fork_wa,
+                    seal_end - a_end,
+                    b_end - seal_end,
+                    pin_end - b_end,
+                    pre_end - pin_end,
+                    arm_ends[0] - pre_end,
+                    arm_ends[1] - arm_ends[0],
+                ),
             );
             (parent_seal, block, prev, parent)
         }
