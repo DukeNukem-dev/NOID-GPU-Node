@@ -721,3 +721,103 @@ extern "C" __global__ void fold_base1(f256 *dst, const u128 *src, uint64_t half,
     f256 v = fscale(ch, x(lo, hi)); v.lo = x(v.lo, lo); dst[i] = v;
   }
 }
+
+// ---- Walk kernels with descriptors passed by value in the launch parameters (no per-step uploads).
+#define WMAX 12
+struct wd12 { wdesc d[WMAX]; };
+struct ed12 { edesc d[WMAX]; };
+struct rd12 { rdesc d[WMAX]; };
+extern "C" __global__ void dwc_rel_first(wd12 D, rc4 rc, int full, f256 *partials) {
+  const wdesc &w = D.d[blockIdx.y];
+  f256 r[8];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) r[k] = FZ;
+  const row4 *S = (const row4 *)w.st;
+  for (uint64_t p = GID; p < w.pairs; p += GSTRIDE) {
+    f256 wt = w.eq[p]; row4 lo = S[2 * p], hi = S[2 * p + 1];
+    f256 pb = FZ, pd = FZ;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) {
+      u128 dl = x(lo.l[l], hi.l[l]);
+      if (full || l == 0) {
+        f256 wc = fmul(wt, w.cols.c[l]);
+        if ((dl.lo | dl.hi) == 0) {
+          r[0] = fx(r[0], fscale(wc, sbox(x(lo.l[l], rc.r[l]))));
+        } else {
+          u128 c[8]; aff7(x(lo.l[l], rc.r[l]), dl, c);
+          #pragma unroll
+          for (int k = 0; k < 8; k++) r[k] = fx(r[k], fscale(wc, c[k]));
+        }
+      } else { pb = fx(pb, fscale(w.cols.c[l], lo.l[l])); pd = fx(pd, fscale(w.cols.c[l], dl)); }
+    }
+    if (!full) { r[0] = fx(r[0], fmul(wt, pb)); r[1] = fx(r[1], fmul(wt, pd)); }
+  }
+  reduce8(r, partials + (uint64_t)blockIdx.y * gridDim.x * 8);
+}
+extern "C" __global__ void dwc_rel_wide(wd12 D, rc4 rc, int full, f256 *partials) {
+  const wdesc &w = D.d[blockIdx.y];
+  f256 r[8];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) r[k] = FZ;
+  const frow4 *st = (const frow4 *)w.st;
+  for (uint64_t p = GID; p < w.pairs; p += GSTRIDE) {
+    f256 wt = fx(w.eq[2 * p], w.eq[2 * p + 1]); frow4 lo = st[2 * p], hi = st[2 * p + 1];
+    f256 pb = FZ, pd = FZ;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) {
+      f256 dl = fx(lo.l[l], hi.l[l]);
+      if (full || l == 0) {
+        f256 a = lo.l[l]; a.lo = x(a.lo, rc.r[l]);
+        f256 wc = fmul(wt, w.cols.c[l]);
+        if ((dl.lo.lo | dl.lo.hi | dl.hi.lo | dl.hi.hi) == 0) {
+          f256 a2 = fsq(a), a4 = fsq(a2);
+          r[0] = fx(r[0], fmul(wc, fmul(fmul(a4, a2), a)));
+        } else {
+          f256 c[8]; faff7(a, dl, c);
+          #pragma unroll
+          for (int k = 0; k < 8; k++) r[k] = fx(r[k], fmul(wc, c[k]));
+        }
+      } else { pb = fx(pb, fmul(w.cols.c[l], lo.l[l])); pd = fx(pd, fmul(w.cols.c[l], dl)); }
+    }
+    if (!full) { r[0] = fx(r[0], fmul(wt, pb)); r[1] = fx(r[1], fmul(wt, pd)); }
+  }
+  reduce8(r, partials + (uint64_t)blockIdx.y * gridDim.x * 8);
+}
+extern "C" __global__ void dwc_fold_first(wd12 D, f256 ch) {
+  const wdesc &w = D.d[blockIdx.y];
+  const row4 *S = (const row4 *)w.st; frow4 *dst = (frow4 *)w.st_dst;
+  for (uint64_t i = GID; i < w.half; i += GSTRIDE) {
+    row4 lo = S[2 * i], hi = S[2 * i + 1]; frow4 o;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) { f256 v = fscale(ch, x(lo.l[l], hi.l[l])); v.lo = x(v.lo, lo.l[l]); o.l[l] = v; }
+    dst[i] = o;
+  }
+}
+extern "C" __global__ void dwc_fold_wide(wd12 D, f256 ch) {
+  const wdesc &w = D.d[blockIdx.y];
+  const frow4 *st = (const frow4 *)w.st; frow4 *dst = (frow4 *)w.st_dst;
+  for (uint64_t i = GID; i < w.half; i += GSTRIDE) {
+    f256 lo = w.eq[2 * i], hi = w.eq[2 * i + 1];
+    w.eq_dst[i] = fx(lo, fmul(ch, fx(lo, hi)));
+    frow4 a = st[2 * i], b = st[2 * i + 1], o;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) o.l[l] = fx(a.l[l], fmul(ch, fx(a.l[l], b.l[l])));
+    dst[i] = o;
+  }
+}
+// buf[0] = 1 for every child with a buffer (start of build_eq_table).
+extern "C" __global__ void dwc_eq_init(ed12 D) {
+  const edesc &e = D.d[blockIdx.y];
+  if (threadIdx.x == 0 && e.buf) e.buf[0] = f256{{1, 0}, {0, 0}};
+}
+extern "C" __global__ void dwc_eq_step(ed12 D) {
+  const edesc &e = D.d[blockIdx.y];
+  for (uint64_t i = GID; i < e.len; i += GSTRIDE) { f256 v = e.buf[i]; e.buf[i + e.len] = fmul(v, e.r); e.buf[i] = fmul(v, f1p(e.r)); }
+}
+extern "C" __global__ void dwc_window(rd12 D, uint64_t base, uint64_t len, const u128 *rc, const u128 *mds) {
+  const rdesc &r = D.d[blockIdx.y];
+  for (uint64_t i = GID; i < r.n; i += GSTRIDE) {
+    row4 s = r.ck[i]; r.win[i] = s;
+    for (uint64_t k = 1; k < len; k++) { s = dw_round((int)(base + k - 1), s, rc, mds); r.win[k * r.n + i] = s; }
+  }
+}

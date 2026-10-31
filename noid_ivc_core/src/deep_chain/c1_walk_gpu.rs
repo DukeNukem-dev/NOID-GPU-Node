@@ -67,6 +67,17 @@ struct RDesc {
     win: u64,
 }
 const _: () = assert!(std::mem::size_of::<WDesc>() == 176 && std::mem::size_of::<EDesc>() == 48);
+/// Descriptor arrays passed by value as kernel parameters (no uploads); at most WMAX children.
+const WMAX: usize = 12;
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Wd12([WDesc; WMAX]);
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Ed12([EDesc; WMAX]);
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rd12([RDesc; WMAX]);
 
 fn raw(v: F256) -> [u64; 4] {
     [v.lo.lo, v.lo.hi, v.hi.lo, v.hi.hi]
@@ -89,6 +100,13 @@ struct Kernels {
     b_fold_wide: CuFunction,
     b_eq_step: CuFunction,
     b_window: CuFunction,
+    c_rel_first: CuFunction,
+    c_rel_wide: CuFunction,
+    c_fold_first: CuFunction,
+    c_fold_wide: CuFunction,
+    c_eq_init: CuFunction,
+    c_eq_step: CuFunction,
+    c_window: CuFunction,
 }
 
 fn kernels(g: &Gpu) -> Result<Kernels, String> {
@@ -109,6 +127,13 @@ fn kernels(g: &Gpu) -> Result<Kernels, String> {
         b_fold_wide: g.function(c"dwb_fold_wide")?,
         b_eq_step: g.function(c"dwb_eq_step")?,
         b_window: g.function(c"dwb_window")?,
+        c_rel_first: g.function(c"dwc_rel_first")?,
+        c_rel_wide: g.function(c"dwc_rel_wide")?,
+        c_fold_first: g.function(c"dwc_fold_first")?,
+        c_fold_wide: g.function(c"dwc_fold_wide")?,
+        c_eq_init: g.function(c"dwc_eq_init")?,
+        c_eq_step: g.function(c"dwc_eq_step")?,
+        c_window: g.function(c"dwc_window")?,
     })
 }
 
@@ -251,19 +276,15 @@ fn transcript<C: Challenger>(
         let base = (round / SPACING) * SPACING;
         if window_base != base {
             let len = SPACING.min(N_ROUNDS - base);
-            let rd: Vec<RDesc> = base_states
-                .iter()
-                .enumerate()
-                .map(|(child, states)| {
-                    let n = states[0].len();
-                    let c = &st.children[child];
-                    RDesc { ck: c.ckpt.ptr + ((base / SPACING) * n * ROW) as u64, n: n as u64, win: c.window.ptr }
-                })
-                .collect();
-            g.htod(st.rdescs.ptr, &rd)?;
-            let max_n = rd.iter().map(|r| r.n).max().unwrap();
-            let (mut dp, mut b, mut l, mut rcp, mut m) = (st.rdescs.ptr, base as u64, len as u64, consts, mds);
-            g.launch2(k.b_window, grid(max_n), n_children as u64, BLOCK, &mut [arg!(dp), arg!(b), arg!(l), arg!(rcp), arg!(m)])?;
+            let mut rd = Rd12([RDesc::default(); WMAX]);
+            for (child, states) in base_states.iter().enumerate() {
+                let n = states[0].len();
+                let c = &st.children[child];
+                rd.0[child] = RDesc { ck: c.ckpt.ptr + ((base / SPACING) * n * ROW) as u64, n: n as u64, win: c.window.ptr };
+            }
+            let max_n = rd.0.iter().map(|r| r.n).max().unwrap();
+            let (mut b, mut l, mut rcp, mut m) = (base as u64, len as u64, consts, mds);
+            g.launch2(k.c_window, grid(max_n), n_children as u64, BLOCK, &mut [arg!(rd), arg!(b), arg!(l), arg!(rcp), arg!(m)])?;
             window_base = base;
         }
 
@@ -279,32 +300,35 @@ fn transcript<C: Challenger>(
                 tracks.push(Track { w, n, eq_cur: 0, st_cur: 0, len: 1, exhausted: Some((F256::ONE, s0.map(F256::from_base))) });
                 // Coordinate 0 uses the base-field state; keep it via the exhausted slot's F128 image.
             } else {
-                g.htod(c.eq[0].ptr, &[F256::ONE])?;
                 tracks.push(Track { w, n, eq_cur: 0, st_cur: 0, len: n, exhausted: None });
             }
         }
+        {
+            let mut init = Ed12([EDesc::default(); WMAX]);
+            for child in 0..n_children {
+                if w_logs[child] > 0 {
+                    init.0[child].buf = st.children[child].eq[0].ptr;
+                }
+            }
+            g.launch2(k.c_eq_init, 1, n_children as u64, 32, &mut [arg!(init)])?;
+        }
         // Equality tails eq(point[1..]) for every child, one step per launch.
         for j in 0..max_w_log.saturating_sub(1) {
-            let ed: Vec<EDesc> = (0..n_children)
-                .map(|child| {
-                    let w = w_logs[child];
-                    if w >= 2 && j < w - 1 {
-                        EDesc { buf: st.children[child].eq[0].ptr, len: 1 << j, r: raw(groups[child].point[1 + j]) }
-                    } else {
-                        EDesc::default()
-                    }
-                })
-                .collect();
-            g.htod(st.edescs.ptr, &ed)?;
-            let mut dp = st.edescs.ptr;
-            g.launch2(k.b_eq_step, grid(1 << j), n_children as u64, BLOCK, &mut [arg!(dp)])?;
+            let mut ed = Ed12([EDesc::default(); WMAX]);
+            for child in 0..n_children {
+                let w = w_logs[child];
+                if w >= 2 && j < w - 1 {
+                    ed.0[child] = EDesc { buf: st.children[child].eq[0].ptr, len: 1 << j, r: raw(groups[child].point[1 + j]) };
+                }
+            }
+            g.launch2(k.c_eq_step, grid(1 << j), n_children as u64, BLOCK, &mut [arg!(ed)])?;
         }
 
         let mut round_coeffs = Vec::with_capacity(max_w_log);
         let mut point = Vec::with_capacity(max_w_log);
         for coordinate in 0..max_w_log {
             // GPU pair sums for every child that still has tables.
-            let mut descs = vec![WDesc::default(); n_children];
+            let mut descs = Wd12([WDesc::default(); WMAX]);
             let mut max_pairs = 0u64;
             for (child, t) in tracks.iter().enumerate() {
                 if t.exhausted.is_some() {
@@ -314,7 +338,7 @@ fn transcript<C: Challenger>(
                 let pairs = (t.len / 2) as u64;
                 max_pairs = max_pairs.max(pairs);
                 let cols = columns[child].map(raw);
-                descs[child] = if coordinate == 0 {
+                descs.0[child] = if coordinate == 0 {
                     WDesc {
                         eq: c.eq[0].ptr,
                         st: c.window.ptr + ((round - base) * t.n * ROW) as u64,
@@ -338,11 +362,10 @@ fn transcript<C: Challenger>(
             }
             let mut sums = vec![[F256::ZERO; WALK_DEGREE]; n_children];
             if max_pairs > 0 {
-                g.htod(st.descs.ptr, &descs)?;
                 let blocks = rel_blocks(max_pairs);
-                let (mut dp, mut rcv, mut fl, mut parts) = (st.descs.ptr, rc, i32::from(full), st.partials.ptr);
-                let f = if coordinate == 0 { k.b_rel_first } else { k.b_rel_wide };
-                g.launch2(f, blocks, n_children as u64, BLOCK, &mut [arg!(dp), arg!(rcv), arg!(fl), arg!(parts)])?;
+                let (mut rcv, mut fl, mut parts) = (rc, i32::from(full), st.partials.ptr);
+                let f = if coordinate == 0 { k.c_rel_first } else { k.c_rel_wide };
+                g.launch2(f, blocks, n_children as u64, BLOCK, &mut [arg!(descs), arg!(rcv), arg!(fl), arg!(parts)])?;
                 let (mut pp, mut nb, mut out) = (st.partials.ptr, blocks, results);
                 g.launch2(k.b_reduce, n_children as u64, 1, BLOCK, &mut [arg!(pp), arg!(nb), arg!(out)])?;
                 g.dtoh(&mut sums, results)?;
@@ -382,9 +405,9 @@ fn transcript<C: Challenger>(
 
             // Folds: one launch for every child with tables, then host bookkeeping.
             if max_pairs > 0 {
-                let (mut dp, mut ch) = (st.descs.ptr, challenge);
-                let f = if coordinate == 0 { k.b_fold_first } else { k.b_fold_wide };
-                g.launch2(f, grid(max_pairs), n_children as u64, BLOCK, &mut [arg!(dp), arg!(ch)])?;
+                let mut ch = challenge;
+                let f = if coordinate == 0 { k.c_fold_first } else { k.c_fold_wide };
+                g.launch2(f, grid(max_pairs), n_children as u64, BLOCK, &mut [arg!(descs), arg!(ch)])?;
             }
             for (child, t) in tracks.iter_mut().enumerate() {
                 let c = &st.children[child];
@@ -429,7 +452,9 @@ pub(super) fn try_prove<C: Challenger>(
     channel: &mut C,
     min_w_log: usize,
 ) -> Option<Output> {
-    if !enabled() || BREAKER.broken() || base_states.is_empty() || base_states.len() != output_groups.len() {
+    if !enabled() || BREAKER.broken() || base_states.is_empty() || base_states.len() != output_groups.len()
+        || base_states.len() > WMAX
+    {
         return None;
     }
     if N_ROUNDS != 66 || (0..N_ROUNDS).any(|q| is_full_round(q) != !(4..62).contains(&q)) {
