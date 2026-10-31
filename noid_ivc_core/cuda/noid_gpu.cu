@@ -277,7 +277,7 @@ __device__ __forceinline__ void aff7(u128 a, u128 b, u128 c[8]) {
   c[0] = mul(a4a2, a); c[1] = mul(a4a2, b); c[2] = mul(a4b2, a); c[3] = mul(a4b2, b);
   c[4] = mul(b4a2, a); c[5] = mul(b4a2, b); c[6] = mul(b4b2, a); c[7] = mul(b4b2, b);
 }
-__device__ __forceinline__ f256 fsq(f256 a) { return fmul(a, a); }
+__device__ __forceinline__ f256 fsq(f256 a) { u128 h = sq(a.hi); return {x(sq(a.lo), mul(h, F256_TAU)), h}; }
 __device__ __forceinline__ void faff7(f256 a, f256 b, f256 c[8]) {
   f256 a2 = fsq(a), b2 = fsq(b), a4 = fsq(a2), b4 = fsq(b2);
   f256 a4a2 = fmul(a4, a2), b4b2 = fmul(b4, b2), a4b2 = fmul(a4, b2), b4a2 = fmul(b4, a2);
@@ -407,10 +407,14 @@ extern "C" __global__ void dwb_rel_first(const wdesc *d, rc4 rc, int full, f256 
     for (int l = 0; l < 4; l++) {
       u128 dl = x(lo.l[l], hi.l[l]);
       if (full || l == 0) {
-        u128 c[8]; aff7(x(lo.l[l], rc.r[l]), dl, c);
         f256 wc = fmul(wt, w.cols.c[l]);
-        #pragma unroll
-        for (int k = 0; k < 8; k++) r[k] = fx(r[k], fscale(wc, c[k]));
+        if ((dl.lo | dl.hi) == 0) {  // (a + 0 t)^7: only the constant coefficient a^7
+          r[0] = fx(r[0], fscale(wc, sbox(x(lo.l[l], rc.r[l]))));
+        } else {
+          u128 c[8]; aff7(x(lo.l[l], rc.r[l]), dl, c);
+          #pragma unroll
+          for (int k = 0; k < 8; k++) r[k] = fx(r[k], fscale(wc, c[k]));
+        }
       } else { pb = fx(pb, fscale(w.cols.c[l], lo.l[l])); pd = fx(pd, fscale(w.cols.c[l], dl)); }
     }
     if (!full) { r[0] = fx(r[0], fmul(wt, pb)); r[1] = fx(r[1], fmul(wt, pd)); }
@@ -431,10 +435,15 @@ extern "C" __global__ void dwb_rel_wide(const wdesc *d, rc4 rc, int full, f256 *
       f256 dl = fx(lo.l[l], hi.l[l]);
       if (full || l == 0) {
         f256 a = lo.l[l]; a.lo = x(a.lo, rc.r[l]);
-        f256 c[8]; faff7(a, dl, c);
         f256 wc = fmul(wt, w.cols.c[l]);
-        #pragma unroll
-        for (int k = 0; k < 8; k++) r[k] = fx(r[k], fmul(wc, c[k]));
+        if ((dl.lo.lo | dl.lo.hi | dl.hi.lo | dl.hi.hi) == 0) {  // only a^7
+          f256 a2 = fsq(a), a4 = fsq(a2);
+          r[0] = fx(r[0], fmul(wc, fmul(fmul(a4, a2), a)));
+        } else {
+          f256 c[8]; faff7(a, dl, c);
+          #pragma unroll
+          for (int k = 0; k < 8; k++) r[k] = fx(r[k], fmul(wc, c[k]));
+        }
       } else { pb = fx(pb, fmul(w.cols.c[l], lo.l[l])); pd = fx(pd, fmul(w.cols.c[l], dl)); }
     }
     if (!full) { r[0] = fx(r[0], fmul(wt, pb)); r[1] = fx(r[1], fmul(wt, pd)); }
