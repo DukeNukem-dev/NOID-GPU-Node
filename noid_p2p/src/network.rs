@@ -496,7 +496,7 @@ const GOSSIP_ACCEPT_BYTES_PER_WINDOW: usize = 64 * 1024 * 1024;
 // and relay upgrades. The former target of twelve amplified Kademlia/circuit
 // retries in a tiny NAT-heavy network; four was too sparse for independent
 // object sources and GUI-to-GUI growth.
-const AUTOMATIC_OUTBOUND_TARGET: usize = 8;
+const AUTOMATIC_OUTBOUND_TARGET: usize = 16; // amun: was 8 (more neighbours, shorter block propagation path)
 // Inbound and behaviour-owned transports are useful bidirectional mesh
 // neighbours, but allowing them to satisfy the complete target lets a small
 // inbound set stop independent peer discovery. Credit at most half of the
@@ -512,7 +512,7 @@ const MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS: usize =
 // Eight peers may legitimately use two relay/direct paths each. Keep another
 // eight bounded slots for bootstrap overlap and DCUtR while staying well below
 // the swarm's 64 established-outbound ceiling.
-const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 24;
+const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 40; // amun: was 24
 // The swarm itself admits at most 32 pending outbound transports.
 const _: () = assert!(MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS <= 32);
 // Most GUI nodes discovered through Kademlia are not publicly dialable through
