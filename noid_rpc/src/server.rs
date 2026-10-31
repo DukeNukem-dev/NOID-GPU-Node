@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -418,6 +419,8 @@ enum ExternalMiningAttemptState<T> {
     Preparing {
         template_id: ExternalMiningTemplateId,
         invalidated: bool,
+        /// Set on a tip change so the running proof stops at its next phase boundary.
+        cancel: Arc<AtomicBool>,
     },
     Ready(CachedExternalMiningTemplate<T>),
     Proving {
@@ -471,8 +474,17 @@ impl<T> ExternalMiningAttemptSlot<T> {
         self.state = ExternalMiningAttemptState::Preparing {
             template_id,
             invalidated: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         Ok(template_id)
+    }
+
+    fn preparation_cancel_flag(&self, template_id: ExternalMiningTemplateId) -> Option<Arc<AtomicBool>> {
+        match &self.state {
+            ExternalMiningAttemptState::Preparing { template_id: active, cancel, .. }
+                if *active == template_id => Some(cancel.clone()),
+            _ => None,
+        }
     }
 
     fn cancel_preparation(&mut self, template_id: ExternalMiningTemplateId) {
@@ -500,6 +512,7 @@ impl<T> ExternalMiningAttemptSlot<T> {
             ExternalMiningAttemptState::Preparing {
                 template_id: active,
                 invalidated: false,
+                ..
             } if *active == template_id
         );
         if !installable {
@@ -569,11 +582,12 @@ impl<T> ExternalMiningAttemptSlot<T> {
     fn invalidate_except(&mut self, tip_height: u64, tip_id: [u8; 32]) {
         match &mut self.state {
             ExternalMiningAttemptState::Idle => {}
-            ExternalMiningAttemptState::Preparing { invalidated, .. } => {
+            ExternalMiningAttemptState::Preparing { invalidated, cancel, .. } => {
                 // The parent may have been captured immediately before this
                 // canonical advance. Keep the owner occupied until its running
                 // preparation returns, but never publish that result.
                 *invalidated = true;
+                cancel.store(true, Ordering::Release);
             }
             ExternalMiningAttemptState::Ready(cached) => {
                 if cached.parent_height != tip_height || cached.parent_id != tip_id {
@@ -661,6 +675,15 @@ struct ExternalMiningPreparationLease {
 impl ExternalMiningPreparationLease {
     const fn template_id(&self) -> ExternalMiningTemplateId {
         self.template_id
+    }
+
+    fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.attempts
+            .inner
+            .lock()
+            .ok()
+            .and_then(|slot| slot.preparation_cancel_flag(self.template_id))
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(true)))
     }
 
     fn install_ready(
@@ -1343,10 +1366,16 @@ impl RpcHandler {
             .as_ref()
             .cloned()
             .ok_or_else(|| rpc_err("HistoryStep producer authorization is unavailable"))?;
+        let cancel = preparation.cancel_flag();
         let (prepared, prepare_elapsed) = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             let result = noid_miner::install_history_step_phase_cpu(|| {
-                PreparedBlockAttempt::prepare(tmpl, &runtime, &ghost, now)
+                PreparedBlockAttempt::prepare_cancellable(tmpl, &runtime, &ghost, now, &cancel)
+                    .and_then(|prepared| {
+                        prepared.ok_or_else(|| {
+                            "chain tip changed while preparing external mining template".to_string()
+                        })
+                    })
             })
             .map_err(|error| format!("HistoryStep CPU admission failed: {error}"))
             .and_then(|result| result);
@@ -3205,6 +3234,22 @@ mod tests {
 
         assert_eq!(queries, 20);
         assert_eq!(next_index, 21);
+    }
+
+    #[test]
+    fn tip_change_sets_the_running_preparation_cancel_flag() {
+        // amun/proving: a tip change must stop a running proof, not only discard its result.
+        let now = Instant::now();
+        let mut slot = ExternalMiningAttemptSlot::<()>::new(7);
+        let preparing = slot.reserve_preparation(now).unwrap();
+        let flag = slot.preparation_cancel_flag(preparing).unwrap();
+        assert!(!flag.load(Ordering::Acquire));
+        slot.invalidate_except(1, [1u8; 32]);
+        assert!(flag.load(Ordering::Acquire));
+        assert!(slot.reserve_preparation(now).is_err());
+        slot.cancel_preparation(preparing);
+        let next = slot.reserve_preparation(now).unwrap();
+        assert!(!slot.preparation_cancel_flag(next).unwrap().load(Ordering::Acquire));
     }
 
     #[test]
