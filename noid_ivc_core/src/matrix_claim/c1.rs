@@ -808,7 +808,26 @@ impl MatrixFoldRows<'_> {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[path = "c1_gpu.rs"]
+mod fold_gpu;
+
+/// amun: the fold on the GPU when available (identical proof and transcript), else on the CPU.
 fn prove_from_rows<Ch: Challenger>(
+    rows: MatrixFoldRows<'_>,
+    fresh: &C1FreshLincheckClaim,
+    incoming: &C1MatrixAccClaim,
+    gate: bool,
+    channel: &mut Ch,
+) -> (C1MatrixFoldProof, C1MatrixAccClaim) {
+    #[cfg(target_os = "linux")]
+    if let Some(out) = fold_gpu::try_prove_from_rows(&rows, fresh, incoming, gate, channel) {
+        return out;
+    }
+    prove_from_rows_cpu(rows, fresh, incoming, gate, channel)
+}
+
+fn prove_from_rows_cpu<Ch: Challenger>(
     rows: MatrixFoldRows<'_>,
     fresh: &C1FreshLincheckClaim,
     incoming: &C1MatrixAccClaim,

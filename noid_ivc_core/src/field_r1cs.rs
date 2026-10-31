@@ -4230,6 +4230,11 @@ impl CompactFieldR1cs {
         1usize << self.shape.k_log
     }
 
+    /// amun: the authenticated statement digest (keys the GPU copy of the matrix).
+    pub(crate) fn amun_statement_digest(&self) -> [u8; 32] {
+        self.statement_digest
+    }
+
     /// `a = (I ⊗ A_0) · z` directly from the compact planar bytes.
     pub fn apply_a(&self, z: &[F128]) -> Vec<F128> {
         apply_block_diag_compact(

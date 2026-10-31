@@ -26,6 +26,8 @@ pub mod deep_chain;
 pub mod field;
 pub mod field_circuit;
 pub mod field_r1cs;
+#[cfg(target_os = "linux")]
+pub(crate) mod gpu;
 pub mod lincheck;
 pub mod matrix_claim;
 pub mod merkle;
