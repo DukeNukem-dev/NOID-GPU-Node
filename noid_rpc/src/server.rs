@@ -615,6 +615,11 @@ impl Default for ExternalMiningAttemptInvalidator {
     }
 }
 
+fn shadow_verify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NOID_SHADOW_VERIFY").map_or(true, |v| v != "0"))
+}
+
 impl ExternalMiningAttemptInvalidator {
     pub fn new() -> Self {
         Self {
@@ -1475,9 +1480,23 @@ impl RpcHandler {
         }
 
         let template_id = preparation.template_id();
+        let shadow = shadow_verify_enabled().then(|| prepared.shadow_verify_inputs());
         preparation
             .install_ready(prepared, parent_height, parent_id, Instant::now())
             .map_err(|error| rpc_err(format!("install external mining attempt: {error}")))?;
+        if let (Some((bytes, header, epoch)), Some(runtime)) =
+            (shadow, self.history_step_runtime.as_ref().cloned())
+        {
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = runtime.verify_terminal(&bytes, &header, &epoch);
+                let verify_ms = started.elapsed().as_millis();
+                match result {
+                    Ok(()) => tracing::info!(height = header.height, verify_ms, "amun shadow verify ok"),
+                    Err(error) => tracing::error!(height = header.height, verify_ms, %error, "amun shadow verify FAILED"),
+                }
+            });
+        }
         Ok(BlockTemplateResponse {
             template_id: hex::encode(template_id),
             pow_fields_hex,

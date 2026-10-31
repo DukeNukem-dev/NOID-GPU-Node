@@ -47,6 +47,8 @@ pub struct PreparedBlockAttempt {
     retained_bytes: usize,
     state_commit: PreparedStateCommit,
     proof_class: MiningProofClass,
+    /// amun/proving: the tx-epoch anchor header, kept for shadow verification.
+    epoch_anchor_header: noid_chain::BlockHeader,
 }
 
 /// A private-capability carrier created only after the HistoryStep prover has
@@ -306,6 +308,7 @@ impl PreparedBlockAttempt {
                 retained_bytes,
                 state_commit: prepared_state_commit,
                 proof_class: MiningProofClass::V21(class),
+                epoch_anchor_header: parent_tx_epoch_anchor_header,
             }));
         }
         if noid_chain::consensus::params::v2_active(block.header.height) {
@@ -423,6 +426,7 @@ impl PreparedBlockAttempt {
                 retained_bytes,
                 state_commit: prepared_state_commit,
                 proof_class: MiningProofClass::V2(class),
+                epoch_anchor_header: parent_tx_epoch_anchor_header,
             }));
         }
         if v2_class.is_some() || v21_class.is_some() || !object_openings.is_empty() {
@@ -545,6 +549,7 @@ impl PreparedBlockAttempt {
             retained_bytes,
             state_commit: prepared_state_commit,
             proof_class: MiningProofClass::Legacy(proof_class),
+                epoch_anchor_header: parent_tx_epoch_anchor_header,
         }))
     }
 
@@ -583,6 +588,12 @@ impl PreparedBlockAttempt {
     /// Exact block/auth byte weight plus the staged builder's allocated
     /// witness buffer. External lifecycle admission uses this independently
     /// of the consensus payload cap.
+    /// amun/proving: inputs for verifying this attempt's terminal like an imported block
+    /// (terminal bytes, block header, tx-epoch anchor header).
+    pub fn shadow_verify_inputs(&self) -> (Vec<u8>, noid_chain::BlockHeader, noid_chain::BlockHeader) {
+        (self.terminal_bytes.clone(), self.block.header, self.epoch_anchor_header)
+    }
+
     pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
