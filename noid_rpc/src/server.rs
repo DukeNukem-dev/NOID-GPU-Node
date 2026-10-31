@@ -57,7 +57,24 @@ use crate::wallet_submit::{
 /// External workers receive only a short-lived capability for immutable
 /// node-owned material.  The server retains exactly one attempt across its
 /// preparation, PoW, proof and commit lifecycle.
-const EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(30);
+#[allow(dead_code)]
+const UPSTREAM_EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(30);
+
+/// amun/proving: template lifetime (node policy, not consensus). Consensus only bounds timestamps by
+/// median-time-past and +120 s future drift. Longer than upstream's 30 s avoids re-proving (dead time)
+/// in long block gaps; ASERT aging (half-life 6 blocks) makes ~60-90 s the best serial refresh.
+/// NOID_TEMPLATE_TTL=<seconds> overrides (5..=600).
+fn external_mining_template_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        std::env::var("NOID_TEMPLATE_TTL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| (5..=600).contains(s))
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(75))
+    })
+}
 
 /// Bound a holder receipt plus its JSON hex encoding and framing. The terminal
 /// transport ceiling is unchanged; this API also carries its inclusion path.
@@ -699,7 +716,7 @@ impl ExternalMiningPreparationLease {
         now: Instant,
     ) -> Result<(), String> {
         let expires_at = now
-            .checked_add(EXTERNAL_MINING_TEMPLATE_TTL)
+            .checked_add(external_mining_template_ttl())
             .ok_or_else(|| "external template expiry overflow".to_string())?;
         let retained_bytes = prepared.retained_bytes();
         self.attempts
@@ -1509,7 +1526,7 @@ impl RpcHandler {
             nonce_field_index: POW_NONCE_FIELD_INDEX,
             difficulty_target_hex: hex::encode(diff_target),
             height,
-            expires_in_seconds: EXTERNAL_MINING_TEMPLATE_TTL.as_secs(),
+            expires_in_seconds: external_mining_template_ttl().as_secs(),
             n_txs,
             tx_input_counts,
             tx_output_counts,
