@@ -205,6 +205,7 @@ fn pad_const() -> u128 {
 /// The committed columns of one duplex family instance plus the walk
 /// endpoint columns, all flat-basis over `2^w_log` slots (schedule slots
 /// first, then pure ghost permutations continuing the chain).
+#[derive(Clone)]
 pub struct DuplexColumns {
     /// Absorb-lane data columns (zero where no witness lane is absorbed).
     pub a: [Vec<F128>; 2],
@@ -258,12 +259,9 @@ pub fn build_duplex_columns(
                 }
             }
         }
-        let mut state = initial_mds(raw);
+        let (amun_s0, mut state) = crate::deep_chain::amun_rounds_from_raw(raw);
         for j in 0..STATE_SIZE {
-            s0[j][slot] = state[j];
-        }
-        for q in 0..N_ROUNDS {
-            state = apply_round(q, state);
+            s0[j][slot] = amun_s0[j];
         }
         for j in 0..STATE_SIZE {
             s_out[j][slot] = state[j];
@@ -285,6 +283,34 @@ pub fn build_duplex_columns(
         s_out,
         challenges,
     }
+}
+
+/// amun: build independent duplex chains in parallel. `result[i]` equals
+/// `build_duplex_columns(jobs[i].0, jobs[i].1, jobs[i].2, jobs[i].3)`. Jobs with the same layout, IV,
+/// data slice (by address) and width are built once. `NOID_PAR_DUPLEX=0` builds them sequentially.
+pub fn build_duplex_columns_many(jobs: &[(&DuplexLayout, [F128; 2], &[F128], usize)]) -> Vec<DuplexColumns> {
+    use rayon::prelude::*;
+    static PAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let par = *PAR.get_or_init(|| !std::env::var("NOID_PAR_DUPLEX").is_ok_and(|v| v == "0"));
+    let mut first = std::collections::HashMap::new();
+    let mut unique: Vec<usize> = Vec::new();
+    let map: Vec<usize> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| {
+            let key = (j.0 as *const DuplexLayout as usize, j.1, j.2.as_ptr() as usize, j.2.len(), j.3);
+            *first.entry(key).or_insert_with(|| {
+                unique.push(i);
+                unique.len() - 1
+            })
+        })
+        .collect();
+    let build = |&i: &usize| {
+        let j = &jobs[i];
+        build_duplex_columns(j.0, j.1, j.2, j.3)
+    };
+    let built: Vec<DuplexColumns> = if par { unique.par_iter().map(build).collect() } else { unique.iter().map(build).collect() };
+    map.into_iter().map(|u| built[u].clone()).collect()
 }
 
 /// Column indices of one duplex family inside a caller-managed committed
@@ -584,12 +610,9 @@ pub fn build_merkle_path_columns(
             carry
         };
 
-        let mut state = initial_mds(raw);
+        let (amun_s0, mut state) = crate::deep_chain::amun_rounds_from_raw(raw);
         for j in 0..STATE_SIZE {
-            s0[j][slot] = state[j];
-        }
-        for q in 0..N_ROUNDS {
-            state = apply_round(q, state);
+            s0[j][slot] = amun_s0[j];
         }
         for j in 0..STATE_SIZE {
             s_out[j][slot] = state[j];

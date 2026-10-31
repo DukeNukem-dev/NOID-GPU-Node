@@ -72,11 +72,7 @@ pub fn compress_iv_flat() -> [F128; 2] {
 /// `permute_flat_u128` on the lane bit patterns (`F128{lo,hi}` IS the flat
 /// u128), which is the structural anchor of the deep-chain walk.
 pub fn permute_flat_state(raw: [F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
-    let mut state = initial_mds(raw);
-    for q in 0..N_ROUNDS {
-        state = apply_round(q, state);
-    }
-    state
+    crate::deep_chain::amun_rounds_from_raw(raw).1
 }
 
 /// Flat-basis one-permutation `hash_pair(a, b)`: `permute([a, b, 0, 0])`,
@@ -166,12 +162,7 @@ pub struct SourceTreeColumns {
 /// Run one permutation from its raw pre-MDS input, returning the walk's
 /// `s0` (post-`initial_mds`) and the output state (`s_out == c`).
 pub fn run_perm(raw: [F128; STATE_SIZE]) -> ([F128; STATE_SIZE], [F128; STATE_SIZE]) {
-    let s0 = initial_mds(raw);
-    let mut state = s0;
-    for q in 0..N_ROUNDS {
-        state = apply_round(q, state);
-    }
-    (s0, state)
+    crate::deep_chain::amun_rounds_from_raw(raw)
 }
 
 /// The two code lanes a leaf reads at its odd slot (`CODE0/CODE1` committed

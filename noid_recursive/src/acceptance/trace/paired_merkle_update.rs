@@ -235,12 +235,9 @@ pub fn build_paired_merkle_update_columns(
             _ => unreachable!(),
         };
 
-        let mut state = initial_mds(raw);
+        let (amun_s0, mut state) = noid_ivc_core::deep_chain::amun_rounds_from_raw(raw);
         for lane in 0..STATE_SIZE {
-            s0[lane][slot] = state[lane];
-        }
-        for round in 0..N_ROUNDS {
-            state = apply_round(round, state);
+            s0[lane][slot] = amun_s0[lane];
         }
         for lane in 0..STATE_SIZE {
             s_out[lane][slot] = state[lane];

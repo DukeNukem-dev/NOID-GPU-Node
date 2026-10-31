@@ -125,12 +125,9 @@ pub fn build_family(seed: u64) -> Family {
             [x, y, F128::ZERO, F128::ZERO]
         };
 
-        let mut state = initial_mds(raw);
+        let (amun_s0, mut state) = crate::deep_chain::amun_rounds_from_raw(raw);
         for j in 0..STATE_SIZE {
-            s0[j][w] = state[j];
-        }
-        for q in 0..N_ROUNDS {
-            state = apply_round(q, state);
+            s0[j][w] = amun_s0[j];
         }
         for j in 0..STATE_SIZE {
             s_out[j][w] = state[j];

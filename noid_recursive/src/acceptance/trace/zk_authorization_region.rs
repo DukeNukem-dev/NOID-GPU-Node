@@ -192,8 +192,10 @@ fn build_split_duplex_union(
     let mut prefix_state: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; data.len()]);
     let mut challenges = Vec::with_capacity(data.len());
 
-    for (tx, stream) in data.iter().enumerate() {
-        let columns = build_duplex_columns(full_layout, iv_flat, stream, full_log);
+    let amun_cols = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &data.iter().map(|stream| (full_layout, iv_flat, stream.as_slice(), full_log)).collect::<Vec<_>>(),
+    );
+    for (tx, columns) in amun_cols.into_iter().enumerate() {
         let prefix_base = tx * prefix_slots;
         let tail_base = tx * tail_slots;
         for lane in 0..2 {

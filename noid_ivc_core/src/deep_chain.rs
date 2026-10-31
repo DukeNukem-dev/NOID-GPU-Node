@@ -214,6 +214,48 @@ fn mds_apply_partial(
     ]
 }
 
+/// amun: `initial_mds(raw)` and the 66-round output from the raw pre-MDS state. Uses the fast flat
+/// Poseidon2b permutation (`permute_flat_u128`: same schedule, same field values); `NOID_FAST_NATIVE=0`
+/// keeps the round-by-round loop.
+#[inline]
+pub fn amun_rounds_from_raw(raw: [F128; STATE_SIZE]) -> ([F128; STATE_SIZE], [F128; STATE_SIZE]) {
+    let s0 = initial_mds(raw);
+    if amun_fast_native() {
+        let mut u = raw.map(|v| (v.lo as u128) | ((v.hi as u128) << 64));
+        noid_poseidon2b::native::permutation::permute_flat_u128(&mut u);
+        return (s0, u.map(|v| F128::new(v as u64, (v >> 64) as u64)));
+    }
+    let mut state = s0;
+    for q in 0..N_ROUNDS {
+        state = apply_round(q, state);
+    }
+    (s0, state)
+}
+
+fn amun_fast_native() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("NOID_FAST_NATIVE").is_ok_and(|v| v == "0"))
+}
+
+#[cfg(test)]
+mod amun_fast_native_tests {
+    use super::*;
+    #[test]
+    fn fast_rounds_match_round_loop() {
+        let mut x = 0x1234_5678_9abc_def1u64;
+        let mut next = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+        for _ in 0..4096 {
+            let raw: [F128; STATE_SIZE] = std::array::from_fn(|_| F128::new(next(), next()));
+            let s0 = initial_mds(raw);
+            let mut state = s0;
+            for q in 0..N_ROUNDS {
+                state = apply_round(q, state);
+            }
+            assert_eq!(amun_rounds_from_raw(raw), (s0, state));
+        }
+    }
+}
+
 /// Apply round `q` to one slot's state (mirrors the native round order).
 pub fn apply_round(q: usize, state: [F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
     let sch = schedule();
@@ -3058,3 +3100,4 @@ mod tests {
         );
     }
 }
+

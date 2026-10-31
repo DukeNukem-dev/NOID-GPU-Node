@@ -6507,9 +6507,12 @@ pub(crate) fn build_duplex_union(
     let mut challenges = Vec::with_capacity(k);
     let zero_data = vec![F128::ZERO; layout.n_data];
 
-    for blk in 0..n_blocks {
-        let d = data.get(blk).unwrap_or(&zero_data);
-        let cols = build_duplex_columns(layout, iv_flat, d, block_log);
+    let amun_cols = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &(0..n_blocks)
+            .map(|blk| (layout, iv_flat, data.get(blk).unwrap_or(&zero_data).as_slice(), block_log))
+            .collect::<Vec<_>>(),
+    );
+    for (blk, cols) in amun_cols.into_iter().enumerate() {
         let off = blk * per_tx;
         for j in 0..2 {
             committed[j][off..off + per_tx].copy_from_slice(&cols.a[j]);
@@ -6598,9 +6601,12 @@ pub(crate) fn build_duplex_union_with_recordings(
 
     // Region 1: real channel blocks + zero-data ghost channels to the
     // region boundary (each block IV-re-seeded by the gated START).
-    for blk in 0..r1_len / per_tx {
-        let d = data.get(blk).unwrap_or(&zero_data);
-        let cols = build_duplex_columns(layout, iv_flat, d, block_log);
+    let amun_cols = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &(0..r1_len / per_tx)
+            .map(|blk| (layout, iv_flat, data.get(blk).unwrap_or(&zero_data).as_slice(), block_log))
+            .collect::<Vec<_>>(),
+    );
+    for (blk, cols) in amun_cols.into_iter().enumerate() {
         let off = blk * per_tx;
         for j in 0..2 {
             committed[j][off..off + per_tx].copy_from_slice(&cols.a[j]);
@@ -6726,6 +6732,16 @@ pub(crate) fn build_recording_only_duplex_union(recordings: &[RecordingSpec<'_>]
             *carry = gout;
         }
     };
+    let mut amun_cols: Vec<Option<_>> = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &recordings
+            .iter()
+            .enumerate()
+            .map(|(i, rec)| (&rec.layout, rec.iv_flat, rec.data, sizes[i].trailing_zeros() as usize))
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .map(Some)
+    .collect();
     for &rec_index in &order {
         fill_carry(
             &mut committed,
@@ -6738,7 +6754,8 @@ pub(crate) fn build_recording_only_duplex_union(recordings: &[RecordingSpec<'_>]
         let rec = &recordings[rec_index];
         let size = sizes[rec_index];
         let s_log = size.trailing_zeros() as usize;
-        let cols = build_duplex_columns(&rec.layout, rec.iv_flat, rec.data, s_log);
+        let cols = amun_cols[rec_index].take().expect("precomputed duplex chain");
+        let _ = (rec, s_log);
         let offset = offsets[rec_index];
         for lane in 0..2 {
             committed[lane][offset..offset + size].copy_from_slice(&cols.a[lane]);
@@ -6869,12 +6886,23 @@ pub(crate) fn fill_recording_region(
             *carry = gout;
         }
     };
+    let mut amun_cols: Vec<Option<_>> = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &recordings
+            .iter()
+            .enumerate()
+            .map(|(i, rec)| (&rec.layout, rec.iv_flat, rec.data, packing.sizes[i].trailing_zeros() as usize))
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .map(Some)
+    .collect();
     for &r in &packing.order {
         fill_carry(committed, s0, s_out, &mut carry, cursor, packing.offsets[r]);
         let rec = &recordings[r];
         let sz = packing.sizes[r];
         let s_log = sz.trailing_zeros() as usize;
-        let cols = build_duplex_columns(&rec.layout, rec.iv_flat, rec.data, s_log);
+        let cols = amun_cols[r].take().expect("precomputed duplex chain");
+        let _ = (rec, s_log);
         let off = packing.offsets[r];
         for j in 0..2 {
             committed[j][off..off + sz].copy_from_slice(&cols.a[j]);
@@ -8023,6 +8051,21 @@ pub(crate) fn build_combined_duplex_union(
     let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; p]);
     let mut challenges: Vec<Vec<F128>> = Vec::with_capacity(k);
 
+    let amun_zero: Vec<Vec<F128>> = subs_padded.iter().map(|sub| vec![F128::ZERO; sub.layout.n_data]).collect();
+    let amun_blocks = n_tx_blocks;
+    let mut amun_cols: Vec<Option<_>> = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &(0..amun_blocks)
+            .flat_map(|blk| (0..subs_padded.len()).map(move |i| (blk, i)))
+            .map(|(blk, i)| {
+                let sub = &subs_padded[i];
+                let d: &[F128] = if blk < k && i < n_real { &data[blk][i] } else { &amun_zero[i] };
+                (&sub.layout, sub.iv_flat, d, s_log)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .map(Some)
+    .collect();
     for blk in 0..n_tx_blocks {
         let mut tx_challenges: Vec<F128> = Vec::new();
         for (i, sub) in subs_padded.iter().enumerate() {
@@ -8035,7 +8078,8 @@ pub(crate) fn build_combined_duplex_union(
             // Each sub-block is an S-slot homogeneous block: slot 0 is
             // IV-seeded, later slots carry, and the tail past the real schedule is
             // the continuing chain fill — copied wholesale into the tiled domain.
-            let cols = build_duplex_columns(&sub.layout, sub.iv_flat, d, s_log);
+            let cols = amun_cols[blk * subs_padded.len() + i].take().expect("precomputed duplex chain");
+            let _ = d;
             let off = blk * per_tx + i * s;
             for j in 0..2 {
                 committed[j][off..off + s].copy_from_slice(&cols.a[j]);
@@ -8148,6 +8192,21 @@ pub(crate) fn build_combined_duplex_union_with_recordings(
 
     // Region 1: the combined tiling (real tx blocks + zero-data ghost
     // tiles up to the region boundary).
+    let amun_zero: Vec<Vec<F128>> = subs_padded.iter().map(|sub| vec![F128::ZERO; sub.layout.n_data]).collect();
+    let amun_blocks = r1_len / per_tx;
+    let mut amun_cols: Vec<Option<_>> = noid_ivc_core::deep_chain::schedule::build_duplex_columns_many(
+        &(0..amun_blocks)
+            .flat_map(|blk| (0..subs_padded.len()).map(move |i| (blk, i)))
+            .map(|(blk, i)| {
+                let sub = &subs_padded[i];
+                let d: &[F128] = if blk < k && i < n_real { &data[blk][i] } else { &amun_zero[i] };
+                (&sub.layout, sub.iv_flat, d, s_log)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .into_iter()
+    .map(Some)
+    .collect();
     for blk in 0..r1_len / per_tx {
         let mut tx_challenges: Vec<F128> = Vec::new();
         for (i, sub) in subs_padded.iter().enumerate() {
@@ -8157,7 +8216,8 @@ pub(crate) fn build_combined_duplex_union_with_recordings(
             } else {
                 &zero_data
             };
-            let cols = build_duplex_columns(&sub.layout, sub.iv_flat, d, s_log);
+            let cols = amun_cols[blk * subs_padded.len() + i].take().expect("precomputed duplex chain");
+            let _ = d;
             let off = blk * per_tx + i * s;
             for j in 0..2 {
                 committed[j][off..off + s].copy_from_slice(&cols.a[j]);
