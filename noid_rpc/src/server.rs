@@ -544,6 +544,14 @@ impl<T> ExternalMiningAttemptSlot<T> {
         Ok(template_id)
     }
 
+    /// True while `template_id` is the live (not invalidated) preparation or successor preparation.
+    fn is_preparing(&self, template_id: ExternalMiningTemplateId) -> bool {
+        if self.successor.as_ref().is_some_and(|n| n.template_id == template_id && !n.invalidated) {
+            return true;
+        }
+        matches!(&self.state, ExternalMiningAttemptState::Preparing { template_id: active, invalidated: false, .. }
+            if *active == template_id)
+    }
     fn preparation_cancel_flag(&self, template_id: ExternalMiningTemplateId) -> Option<Arc<AtomicBool>> {
         if let Some(next) = self.successor.as_ref().filter(|n| n.template_id == template_id) {
             return Some(next.cancel.clone());
@@ -725,6 +733,11 @@ fn amun_first_template_for(parent_height: u64) -> bool {
     LAST.swap(parent_height, std::sync::atomic::Ordering::Relaxed) != parent_height
 }
 
+fn amun_early_job() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("NOID_EARLY_JOB").is_ok_and(|v| v == "0"))
+}
+
 fn amun_template_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("NOID_TEMPLATE_TRACE").is_ok_and(|v| v != "0"))
@@ -751,6 +764,10 @@ impl ExternalMiningAttemptInvalidator {
             Ok(mut slot) => slot.invalidate_except(tip_height, tip_id),
             Err(_) => tracing::error!("external mining attempt slot lock poisoned"),
         }
+    }
+
+    fn is_preparing(&self, template_id: ExternalMiningTemplateId) -> bool {
+        self.inner.lock().map(|slot| slot.is_preparing(template_id)).unwrap_or(false)
     }
 
     fn reserve_preparation(&self, now: Instant) -> Result<ExternalMiningPreparationLease, String> {
@@ -1392,6 +1409,7 @@ impl RpcHandler {
         self,
         requested: Option<noid_poseidon2b::primitives::Address>,
         preparation: ExternalMiningPreparationLease,
+        early: Option<tokio::sync::oneshot::Sender<RpcResult<BlockTemplateResponse>>>,
     ) -> RpcResult<BlockTemplateResponse> {
         self.require_mining_network()?;
         let now = std::time::SystemTime::now()
@@ -1498,6 +1516,25 @@ impl RpcHandler {
         let pow_header = tmpl.header_for_pow(0);
         let pow_fields_hex = encode_pow_fields_hex(&pow_header);
         let diff_target = pow_header.difficulty_target;
+        let response = BlockTemplateResponse {
+            template_id: hex::encode(preparation.template_id()),
+            pow_fields_hex: pow_fields_hex.clone(),
+            nonce_field_index: POW_NONCE_FIELD_INDEX,
+            difficulty_target_hex: hex::encode(diff_target),
+            height,
+            expires_in_seconds: external_mining_template_ttl().as_secs(),
+            n_txs,
+            tx_input_counts: tx_input_counts.clone(),
+            tx_output_counts: tx_output_counts.clone(),
+            coinbase_value_micronoid,
+            claimable_fees_micronoid,
+        };
+        // amun: early job hand-out. The PoW covers only these header fields and the HistoryStep proof does not
+        // depend on the nonce, so miners can hash while the proof runs; submitBlock waits for it if a nonce comes
+        // first (NOID_EARLY_JOB=0 restores prove-then-hand-out).
+        if let Some(tx) = early {
+            let _ = tx.send(Ok(response.clone()));
+        }
 
         // Build and prove the complete nonce-independent HistoryStep before
         // exposing the capability. The worker's only remaining job is PoW.
@@ -1643,19 +1680,8 @@ impl RpcHandler {
                 }
             });
         }
-        Ok(BlockTemplateResponse {
-            template_id: hex::encode(template_id),
-            pow_fields_hex,
-            nonce_field_index: POW_NONCE_FIELD_INDEX,
-            difficulty_target_hex: hex::encode(diff_target),
-            height,
-            expires_in_seconds: external_mining_template_ttl().as_secs(),
-            n_txs,
-            tx_input_counts,
-            tx_output_counts,
-            coinbase_value_micronoid,
-            claimable_fees_micronoid,
-        })
+        let _ = template_id;
+        Ok(response)
     }
 
     /// Seal the sole miner-controlled value into an immutable node-owned
@@ -2718,9 +2744,24 @@ impl ParanoidApiServer for RpcHandler {
         // The task, not the request future, owns the lease. Dropping a client
         // connection detaches this coordinator but cannot admit a second
         // attempt while its blocking preparation is still running.
+        if amun_early_job() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let job = tokio::spawn(async move {
+                let r = handler.prepare_external_mining_attempt(requested, preparation, Some(tx)).await;
+                if let Err(e) = &r {
+                    tracing::warn!(error = %e.message(), "external mining preparation after early hand-out failed");
+                }
+                r
+            });
+            return match rx.await {
+                Ok(r) => r,
+                // The coordinator ended before the hand-out point: report its own result.
+                Err(_) => job.await.map_err(|error| rpc_err(format!("external mining coordinator failed: {error}")))?,
+            };
+        }
         tokio::spawn(async move {
             handler
-                .prepare_external_mining_attempt(requested, preparation)
+                .prepare_external_mining_attempt(requested, preparation, None)
                 .await
         })
         .await
@@ -2739,6 +2780,24 @@ impl ParanoidApiServer for RpcHandler {
 
         let template_id = decode_external_template_id(&template_id)?;
         let nonce = decode_external_nonce_hex(&nonce_hex)?;
+        let (tip_height, tip_id) = {
+            let chain = self.chain.read().await;
+            let tip = chain.tip_header();
+            (tip.height, block_id(tip))
+        };
+        // amun: with early hand-out the template may still be proving; wait for it (bounded).
+        let wait_started = Instant::now();
+        let mut waited = false;
+        while self.external_mining_attempts.is_preparing(template_id)
+            && wait_started.elapsed() < Duration::from_secs(90)
+        {
+            waited = true;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if waited {
+            tracing::info!(waited_ms = wait_started.elapsed().as_millis() as u64,
+                           "amun: block nonce arrived before its proof; waited for the proof");
+        }
         let (tip_height, tip_id) = {
             let chain = self.chain.read().await;
             let tip = chain.tip_header();
