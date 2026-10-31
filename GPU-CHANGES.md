@@ -1,0 +1,48 @@
+# Files changed from upstream Parano1d v2.1.0 (848209d5)
+
+Changes are marked `amun:` in the source. See `git log v2.1.0..gpu-node` for each change with its reason.
+
+- `noid_ivc_core/cuda/noid_gpu.cu`
+- `noid_ivc_core/cuda/p2b_consts.h`
+- `noid_ivc_core/src/deep_chain.rs`
+- `noid_ivc_core/src/deep_chain/c1.rs`
+- `noid_ivc_core/src/deep_chain/c1_walk_gpu.rs`
+- `noid_ivc_core/src/deep_chain/family.rs`
+- `noid_ivc_core/src/deep_chain/ff_merkle.rs`
+- `noid_ivc_core/src/deep_chain/relations.rs`
+- `noid_ivc_core/src/deep_chain/relations/c1.rs`
+- `.../src/deep_chain/relations/c1_rel_gpu.rs`
+- `noid_ivc_core/src/deep_chain/schedule.rs`
+- `noid_ivc_core/src/deep_chain/source_tree.rs`
+- `noid_ivc_core/src/field_circuit.rs`
+- `noid_ivc_core/src/field_r1cs.rs`
+- `noid_ivc_core/src/gpu.rs`
+- `noid_ivc_core/src/lib.rs`
+- `noid_ivc_core/src/matrix_claim/c1.rs`
+- `noid_ivc_core/src/matrix_claim/c1_gpu.rs`
+- `noid_ivc_core/src/merkle.rs`
+- `noid_ivc_core/src/merkle_gpu.rs`
+- `noid_ivc_core/src/noid_gpu.fatbin`
+- `noid_ivc_core/src/pcs/commit.rs`
+- `noid_ivc_core/src/pcs/commit_gpu.rs`
+- `noid_ivc_prover/src/field_prover.rs`
+- `noid_miner/src/block_production.rs`
+- `noid_miner/src/template.rs`
+- `noid_node/src/main.rs`
+- `noid_node/src/networking/suffix_sync.rs`
+- `noid_p2p/src/network.rs`
+- `noid_poseidon2b/src/batch.rs`
+- `noid_poseidon2b/src/batch_pclmul.rs`
+- `noid_poseidon2b/src/lib.rs`
+- `noid_poseidon2b/src/native/compression.rs`
+- `noid_poseidon2b/src/native/permutation.rs`
+- `noid_recursive/src/acceptance/block_slots.rs`
+- `.../src/acceptance/history_step/v2/banked.rs`
+- `.../acceptance/history_step/v2/banked/amun_fork.rs`
+- `.../acceptance/history_step/v2/banked/assembly.rs`
+- `.../acceptance/history_step/v2/banked/parent.rs`
+- `noid_recursive/src/acceptance/trace/mod.rs`
+- `.../src/acceptance/trace/paired_merkle_update.rs`
+- `.../src/acceptance/trace/region_source_binding.rs`
+- `.../acceptance/trace/zk_authorization_region.rs`
+- `noid_rpc/src/server.rs`
