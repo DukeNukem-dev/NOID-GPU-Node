@@ -33,6 +33,10 @@ use rayon::prelude::*;
 
 pub type Hash = [u8; 32];
 
+#[cfg(target_os = "linux")]
+#[path = "merkle_gpu.rs"]
+mod gpu;
+
 const POSEIDON_MERKLE_LEAF_TAG: DomainTag = DomainTag::new(b"IVCPCSL_");
 /// Fixed-length (no-pad) leaf mode: block-aligned leaves skip the padding
 /// permutation. Distinct from `IVCPCSL_` so the two modes cannot collide,
@@ -140,7 +144,15 @@ pub fn merkle_root(data: &[u8], num_leaves: usize) -> Hash {
 
 /// Compute the full Merkle tree (flat layout, see module docs) for `data`
 /// split into `num_leaves` equal-sized leaves.
+/// amun: `NOID_MERKLE_TRACE=1` logs one line per tree (shape, leaf and level time).
+fn merkle_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NOID_MERKLE_TRACE").is_ok_and(|v| v != "0"))
+}
+
 pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
+    let trace_t0 = std::time::Instant::now();
+    let mut trace_leaf_ms = 0.0f64;
     assert!(
         num_leaves.is_power_of_two() && num_leaves > 0,
         "num_leaves must be power of 2"
@@ -157,6 +169,20 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
     // leaves at step 1, then each internal level reads the level below (which
     // was just written) and writes itself.
     let mut tree: Vec<Hash> = crate::alloc_uninit_vec(total_nodes);
+
+    // amun: whole tree on the GPU when available (spot-checked; CPU fallback on any problem).
+    #[cfg(target_os = "linux")]
+    if gpu::try_merkle_tree(data, num_leaves, &mut tree).is_some() {
+        if merkle_trace_enabled() {
+            eprintln!(
+                "amun merkle n_leaves={} leaf_size={} gpu_ms={:.2}",
+                num_leaves,
+                leaf_size,
+                trace_t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        return tree;
+    }
 
     // 1. Leaves — the tree's dominant hashing volume (leaf payloads outweigh
     // the 32-byte inner nodes), so it runs on the lockstep packed sponge:
@@ -191,6 +217,9 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
             });
     }
 
+    if merkle_trace_enabled() {
+        trace_leaf_ms = trace_t0.elapsed().as_secs_f64() * 1e3;
+    }
     // 2. Internal levels — parallel within a level, sequential across levels.
     let mut read_start = 0usize;
     let mut read_len = num_leaves;
@@ -237,6 +266,16 @@ pub fn merkle_tree(data: &[u8], num_leaves: usize) -> Vec<Hash> {
         read_len = next_len;
     }
 
+    if merkle_trace_enabled() {
+        let total = trace_t0.elapsed().as_secs_f64() * 1e3;
+        eprintln!(
+            "amun merkle n_leaves={} leaf_size={} leaves_ms={:.2} levels_ms={:.2}",
+            num_leaves,
+            data.len() / num_leaves,
+            trace_leaf_ms,
+            total - trace_leaf_ms
+        );
+    }
     tree
 }
 
