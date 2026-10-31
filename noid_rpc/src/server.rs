@@ -1488,6 +1488,12 @@ impl RpcHandler {
             (shadow, self.history_step_runtime.as_ref().cloned())
         {
             tokio::task::spawn_blocking(move || {
+                let mut bytes = bytes;
+                // Negative control for the shadow check only: flip one byte of the copy.
+                if std::env::var("NOID_SHADOW_CORRUPT").is_ok_and(|v| v == "1") && !bytes.is_empty() {
+                    let i = bytes.len() / 2;
+                    bytes[i] ^= 0x01;
+                }
                 let started = Instant::now();
                 let result = runtime.verify_terminal(&bytes, &header, &epoch);
                 let verify_ms = started.elapsed().as_millis();
