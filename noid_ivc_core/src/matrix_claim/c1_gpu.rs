@@ -26,6 +26,11 @@ static BREAKER: Breaker = Breaker::new();
 const BLOCK: u32 = 256;
 const REDUCE_GRID: u64 = 1024;
 
+fn timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NOIDH_MATRIX_FOLD_TIMING").is_some())
+}
+
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("NOID_GPU_FOLD").is_ok_and(|v| v == "0"))
@@ -40,6 +45,7 @@ struct Matrix {
     col: [DBuf; 2],
     ci: [DBuf; 2],
     cp: DBuf,
+    ecol: DBuf,
     srow: DBuf,
     csc_ci: DBuf,
     nnz: usize,
@@ -50,6 +56,7 @@ struct Kernels {
     outer: CuFunction,
     spmv_rows: CuFunction,
     colimage: CuFunction,
+    colimage_bal: CuFunction,
     fold: CuFunction,
     round_stacked: CuFunction,
     mix_round: CuFunction,
@@ -89,6 +96,7 @@ fn kernels(g: &Gpu) -> Result<Kernels, String> {
         outer: g.function(c"outer")?,
         spmv_rows: g.function(c"spmv_rows")?,
         colimage: g.function(c"colimage")?,
+        colimage_bal: g.function(c"colimage_bal")?,
         fold: g.function(c"fold")?,
         round_stacked: g.function(c"round_stacked")?,
         mix_round: g.function(c"mix_round")?,
@@ -135,6 +143,7 @@ fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matri
         col: Default::default(),
         ci: Default::default(),
         cp: DBuf::default(),
+        ecol: DBuf::default(),
         srow: DBuf::default(),
         csc_ci: DBuf::default(),
         nnz: triples[0].len() + triples[1].len(),
@@ -190,6 +199,15 @@ fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matri
     }
     let p = g.ensure(&mut m.cp, cp.len() * 8)?;
     g.htod(p, &cp)?;
+    let mut ecol = vec![0u32; m.nnz];
+    let mut longest = 0u64;
+    for c in 0..width {
+        ecol[cp[c] as usize..cp[c + 1] as usize].fill(c as u32);
+        longest = longest.max(cp[c + 1] - cp[c]);
+    }
+    let p = g.ensure(&mut m.ecol, ecol.len() * 4)?;
+    g.htod(p, &ecol)?;
+    eprintln!("amun gpu fold: longest column {longest} entries");
     let p = g.ensure(&mut m.srow, srow.len() * 4)?;
     g.htod(p, &srow)?;
     let p = g.ensure(&mut m.csc_ci, ci.len() * 4)?;
@@ -257,7 +275,7 @@ fn prepare(
     let key = (r1cs.amun_statement_digest(), width);
     if st.matrix.as_ref().is_none_or(|m| m.key != key) {
         if let Some(mut old) = st.matrix.take() {
-            for b in [&mut old.dict, &mut old.cp, &mut old.srow, &mut old.csc_ci] {
+            for b in [&mut old.dict, &mut old.cp, &mut old.ecol, &mut old.srow, &mut old.csc_ci] {
                 g.free(b);
             }
             for s in 0..2 {
@@ -337,6 +355,7 @@ fn transcript<Ch: Challenger>(
     let w = &mut st.work;
     let partials = w.partials.ptr;
 
+    let t_start = Instant::now();
     let gate = if gate { F256::ONE } else { F256::ZERO };
     absorb_fold_header(channel, fresh, incoming, gate);
     let gamma = channel.sample_f256();
@@ -412,16 +431,24 @@ fn transcript<Ch: Challenger>(
     let hi = g.ensure(&mut w.eqhi, eqhi.len() * F)?;
     g.htod(hi, &eqhi)?;
     let (mut h, mut h2) = (w.h[0].ptr, w.h[1].ptr);
+    let t_p1 = Instant::now();
     {
-        let (mut cp, mut srow, mut ci, mut dict) = (m.cp.ptr, m.srow.ptr, m.csc_ci.ptr, m.dict.ptr);
-        let (mut ncols, mut lo, mut lb, mut hi, mut out) = (width as u64, lo, low_bits as u64, hi, h);
+        g.zero(h, width * F)?;
+        let (mut ecol, mut srow, mut ci, mut dict) = (m.ecol.ptr, m.srow.ptr, m.csc_ci.ptr, m.dict.ptr);
+        let (mut nnz, mut lo, mut lb, mut hi, mut out) = (m.nnz as u64, lo, low_bits as u64, hi, h);
         g.launch(
-            k.colimage,
-            grid(width as u64),
+            k.colimage_bal,
+            grid((m.nnz as u64).div_ceil(32)),
             BLOCK,
-            &mut [arg!(cp), arg!(srow), arg!(ci), arg!(dict), arg!(ncols), arg!(lo), arg!(lb), arg!(hi), arg!(out)],
+            &mut [arg!(ecol), arg!(srow), arg!(ci), arg!(dict), arg!(nnz), arg!(lo), arg!(lb), arg!(hi), arg!(out)],
         )?;
+        let _ = k.colimage;
     }
+    if timing() {
+        g.sync()?;
+        eprintln!("[matrix-fold-c1-gpu] phase1={:.0}ms column-image={:.0}ms", (t_p1 - t_start).as_secs_f64() * 1e3, t_p1.elapsed().as_secs_f64() * 1e3);
+    }
+    let t_p2 = Instant::now();
 
     // Phase 2 (mix, then run_phase_one_product); weights = v_table, mixed in place.
     let delta_gate = delta * gate;
@@ -463,6 +490,9 @@ fn transcript<Ch: Challenger>(
     }
     let _ = claim;
     let final_matrix_eval = read_one(g, h, 0)?;
+    if timing() {
+        eprintln!("[matrix-fold-c1-gpu] phase2={:.0}ms", t_p2.elapsed().as_secs_f64() * 1e3);
+    }
     channel.observe_f256(final_matrix_eval);
 
     let mut point = rho;

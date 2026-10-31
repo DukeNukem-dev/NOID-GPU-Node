@@ -157,6 +157,30 @@ extern "C" __global__ void colimage(const uint64_t *cp, const uint32_t *srow, co
     h[c] = acc;
   }
 }
+// Column image, load-balanced: thread t takes CSC entries [t*CH, (t+1)*CH), accumulates per column run and
+// XORs each run into h with 64-bit atomics (XOR is field addition, so the result is order-independent).
+// h must be zeroed first. col_of_entry[k] is the column of entry k.
+#define CH 32
+__device__ __forceinline__ void xor_into(f256 *dst, f256 v) {
+  unsigned long long *d = reinterpret_cast<unsigned long long *>(dst);
+  if (v.lo.lo) atomicXor(d + 0, v.lo.lo); if (v.lo.hi) atomicXor(d + 1, v.lo.hi);
+  if (v.hi.lo) atomicXor(d + 2, v.hi.lo); if (v.hi.hi) atomicXor(d + 3, v.hi.hi);
+}
+extern "C" __global__ void colimage_bal(const uint32_t *ecol, const uint32_t *srow, const uint32_t *ci, const u128 *dict,
+                                        uint64_t nnz, const f256 *eqlo, uint64_t lo_bits, const f256 *eqhi, f256 *h) {
+  uint64_t mask = (1ull << lo_bits) - 1;
+  for (uint64_t t = GID; t * CH < nnz; t += GSTRIDE) {
+    uint64_t k0 = t * CH, k1 = min(k0 + CH, nnz);
+    uint32_t c = ecol[k0]; f256 acc = FZ;
+    for (uint64_t k = k0; k < k1; k++) {
+      uint32_t cc = ecol[k];
+      if (cc != c) { xor_into(&h[c], acc); acc = FZ; c = cc; }
+      uint32_t s = srow[k];
+      acc = fx(acc, fscale(fmul(eqlo[s & mask], eqhi[s >> lo_bits]), dict[ci[k]]));
+    }
+    xor_into(&h[c], acc);
+  }
+}
 // dst[i] = lo + ch * (lo + hi)
 extern "C" __global__ void fold(f256 *dst, const f256 *src, uint64_t half, f256 ch) {
   for (uint64_t i = GID; i < half; i += GSTRIDE) { f256 lo = src[2 * i], hi = src[2 * i + 1]; dst[i] = fx(lo, fmul(ch, fx(lo, hi))); }
