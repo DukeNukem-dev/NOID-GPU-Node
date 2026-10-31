@@ -50,6 +50,7 @@ pub(crate) struct Gpu {
     /// Per-user state, owned here so it lives under the same lock.
     pub merkle: Vec<DBuf>,
     pub fold: Option<Box<dyn std::any::Any + Send>>,
+    pub walk: Option<Box<dyn std::any::Any + Send>>,
 }
 // The raw CUDA handles are only used while holding the mutex.
 unsafe impl Send for Gpu {}
@@ -110,7 +111,7 @@ fn init() -> Result<Gpu, String> {
         check(module_load(&mut module, FATBIN.as_ptr().cast()), "cuModuleLoadData")?;
         let name = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
         eprintln!("amun gpu: enabled on {name}");
-        Ok(Gpu { api, ctx, module, name, merkle: Vec::new(), fold: None })
+        Ok(Gpu { api, ctx, module, name, merkle: Vec::new(), fold: None, walk: None })
     }
 }
 

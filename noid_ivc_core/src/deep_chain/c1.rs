@@ -668,7 +668,24 @@ fn fold_base_states(
 ///
 /// The single-group restriction is the production Link/Block shape. It keeps
 /// the equality polynomial factored and avoids four dense E columns.
+#[cfg(target_os = "linux")]
+#[path = "c1_walk_gpu.rs"]
+mod walk_gpu;
+
+/// amun: the walk on the GPU when available (identical proof and transcript), else on the CPU.
 pub fn prove_ragged_deep_chain_walk<C: Challenger>(
+    base_states: &[&[Vec<F128>; STATE_SIZE]],
+    output_groups: &[C1LaneClaimGroup],
+    channel: &mut C,
+) -> (C1MultiDeepChainWalkProof, Vec<C1LaneClaimGroup>) {
+    #[cfg(target_os = "linux")]
+    if let Some(out) = walk_gpu::try_prove(base_states, output_groups, channel, 10) {
+        return out;
+    }
+    prove_ragged_deep_chain_walk_cpu(base_states, output_groups, channel)
+}
+
+fn prove_ragged_deep_chain_walk_cpu<C: Challenger>(
     base_states: &[&[Vec<F128>; STATE_SIZE]],
     output_groups: &[C1LaneClaimGroup],
     channel: &mut C,
@@ -1099,6 +1116,37 @@ mod tests {
         bad.layers[N_ROUNDS / 2].round_coeffs[1][3] += F256::ONE;
         let mut verifier = FsLaneChallenger::new_c1(b"genuine-c1-ragged-walk-test");
         assert!(verify_ragged_deep_chain_walk(&w_logs, &groups, &bad, &mut verifier).is_err());
+    }
+
+    /// amun: the GPU walk gives the CPU walk's proof, terminals and transcript (needs a GPU).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn amun_gpu_walk_matches_cpu() {
+        for w_logs in [vec![2usize, 4, 3], vec![0, 1, 5], vec![6, 3, 7, 1], vec![9, 8]] {
+            let (inputs, groups) = honest_fixture(&w_logs);
+            let references = inputs.iter().collect::<Vec<_>>();
+            let mut cpu_channel = FsLaneChallenger::new_c1(b"amun-gpu-walk-test");
+            let (cpu_proof, cpu_terminals) =
+                prove_ragged_deep_chain_walk_cpu(&references, &groups, &mut cpu_channel);
+            let mut gpu_channel = FsLaneChallenger::new_c1(b"amun-gpu-walk-test");
+            match walk_gpu::try_prove(&references, &groups, &mut gpu_channel, 0) {
+                Some((gpu_proof, gpu_terminals)) => {
+                    assert_eq!(gpu_proof.layers.len(), cpu_proof.layers.len());
+                    for (layer, (g, c)) in gpu_proof.layers.iter().zip(&cpu_proof.layers).enumerate() {
+                        assert_eq!(g.round_coeffs, c.round_coeffs, "round coeffs differ, layer {layer}, w_logs {w_logs:?}");
+                        assert_eq!(g.next_values, c.next_values, "next values differ, layer {layer}, w_logs {w_logs:?}");
+                    }
+                    for (g, c) in gpu_terminals.iter().zip(&cpu_terminals) {
+                        assert_eq!((&g.point, g.values), (&c.point, c.values));
+                    }
+                    assert_eq!(gpu_channel.sample_f256(), cpu_channel.sample_f256(), "transcript differs");
+                    let mut verifier = FsLaneChallenger::new_c1(b"amun-gpu-walk-test");
+                    verify_ragged_deep_chain_walk(&w_logs, &groups, &gpu_proof, &mut verifier).unwrap();
+                    eprintln!("w_logs {w_logs:?}: gpu == cpu, verifies");
+                }
+                None => eprintln!("w_logs {w_logs:?}: no GPU, skipped"),
+            }
+        }
     }
 
     /// Isolated production-width benchmark. Claims are intentionally arbitrary:

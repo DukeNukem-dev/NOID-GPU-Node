@@ -227,3 +227,163 @@ extern "C" __global__ void scale(f256 *out, uint64_t n, f256 s) {
 extern "C" __global__ void f256_mul_test(const f256 *a, const f256 *b, f256 *out, uint64_t n) {
   for (uint64_t i = GID; i < n; i += GSTRIDE) out[i] = fmul(a[i], b[i]);
 }
+
+// ---------------------------------------------------------------- C1 ragged deep-chain walk (deep_chain/c1.rs)
+// Layer states are rows of four flat GF(2^128) lanes. rc: [lane][66] flat round constants; mds: full[16] then
+// partial[16] (row-major). Round q: add rc (all lanes in full rounds, lane 0 in partial), x^7, then MDS.
+#define DW_ROUNDS 66
+struct row4 { u128 l[4]; };
+struct frow4 { f256 l[4]; };
+struct c4 { f256 c[4]; };
+struct rc4 { u128 r[4]; };
+__device__ __forceinline__ bool dw_full(int q) { return !(q >= 4 && q < 4 + 58); }
+__device__ __forceinline__ row4 dw_round(int q, row4 s, const u128 *rc, const u128 *mds) {
+  bool full = dw_full(q);
+  row4 b = s;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) if (full || i == 0) b.l[i] = sbox(x(s.l[i], rc[i * DW_ROUNDS + q]));
+  const u128 *m = mds + (full ? 0 : 16);
+  row4 o;
+  #pragma unroll
+  for (int i = 0; i < 4; i++) {
+    u128 acc = {0, 0};
+    #pragma unroll
+    for (int j = 0; j < 4; j++) acc = x(acc, mul(m[i * 4 + j], b.l[j]));
+    o.l[i] = acc;
+  }
+  return o;
+}
+// ckpt[c] = S_{8c} for c < n_ckpt (ckpt laid out checkpoint-major, n rows each).
+extern "C" __global__ void dw_checkpoints(const row4 *s0, uint64_t n, uint64_t n_ckpt, const u128 *rc, const u128 *mds, row4 *ckpt) {
+  for (uint64_t i = GID; i < n; i += GSTRIDE) {
+    row4 s = s0[i]; ckpt[i] = s;
+    for (uint64_t c = 1; c < n_ckpt; c++) {
+      for (int q = (int)(8 * (c - 1)); q < (int)(8 * c); q++) s = dw_round(q, s, rc, mds);
+      ckpt[c * n + i] = s;
+    }
+  }
+}
+// win[k] = S_{base+k} for k < len, from the checkpoint S_base.
+extern "C" __global__ void dw_window(const row4 *ck, uint64_t n, uint64_t base, uint64_t len, const u128 *rc, const u128 *mds, row4 *win) {
+  for (uint64_t i = GID; i < n; i += GSTRIDE) {
+    row4 s = ck[i]; win[i] = s;
+    for (uint64_t k = 1; k < len; k++) { s = dw_round((int)(base + k - 1), s, rc, mds); win[k * n + i] = s; }
+  }
+}
+// (a + b t)^7 coefficients c_k = a^(7-k) b^k (characteristic two: all binomials are odd).
+__device__ __forceinline__ void aff7(u128 a, u128 b, u128 c[8]) {
+  u128 a2 = sq(a), b2 = sq(b), a4 = sq(a2), b4 = sq(b2);
+  u128 a4a2 = mul(a4, a2), b4b2 = mul(b4, b2), a4b2 = mul(a4, b2), b4a2 = mul(b4, a2);
+  c[0] = mul(a4a2, a); c[1] = mul(a4a2, b); c[2] = mul(a4b2, a); c[3] = mul(a4b2, b);
+  c[4] = mul(b4a2, a); c[5] = mul(b4a2, b); c[6] = mul(b4b2, a); c[7] = mul(b4b2, b);
+}
+__device__ __forceinline__ f256 fsq(f256 a) { return fmul(a, a); }
+__device__ __forceinline__ void faff7(f256 a, f256 b, f256 c[8]) {
+  f256 a2 = fsq(a), b2 = fsq(b), a4 = fsq(a2), b4 = fsq(b2);
+  f256 a4a2 = fmul(a4, a2), b4b2 = fmul(b4, b2), a4b2 = fmul(a4, b2), b4a2 = fmul(b4, a2);
+  c[0] = fmul(a4a2, a); c[1] = fmul(a4a2, b); c[2] = fmul(a4b2, a); c[3] = fmul(a4b2, b);
+  c[4] = fmul(b4a2, a); c[5] = fmul(b4a2, b); c[6] = fmul(b4b2, a); c[7] = fmul(b4b2, b);
+}
+// Block reduction of 8 accumulators (blockDim 128); thread 0 writes partials[8*block + k].
+__device__ __forceinline__ void reduce8(f256 r[8], f256 *partials) {
+  __shared__ f256 s[8][128];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) s[k][threadIdx.x] = r[k];
+  __syncthreads();
+  for (unsigned h = blockDim.x / 2; h > 0; h >>= 1) {
+    if (threadIdx.x < h) {
+      #pragma unroll
+      for (int k = 0; k < 8; k++) s[k][threadIdx.x] = fx(s[k][threadIdx.x], s[k][threadIdx.x + h]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < 8) partials[8 * blockIdx.x + threadIdx.x] = s[threadIdx.x][0];
+}
+// First coordinate (base-field states): pair p has weight tail_eq[p], base S[2p], delta S[2p] + S[2p+1].
+extern "C" __global__ void dw_rel_first(const f256 *tail_eq, const row4 *S, uint64_t pairs, c4 cols, rc4 rc, int full, f256 *partials) {
+  f256 r[8];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) r[k] = FZ;
+  for (uint64_t p = GID; p < pairs; p += GSTRIDE) {
+    f256 w = tail_eq[p]; row4 lo = S[2 * p], hi = S[2 * p + 1];
+    f256 pb = FZ, pd = FZ;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) {
+      u128 d = x(lo.l[l], hi.l[l]);
+      if (full || l == 0) {
+        u128 c[8]; aff7(x(lo.l[l], rc.r[l]), d, c);
+        f256 wc = fmul(w, cols.c[l]);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) r[k] = fx(r[k], fscale(wc, c[k]));
+      } else {
+        pb = fx(pb, fscale(cols.c[l], lo.l[l])); pd = fx(pd, fscale(cols.c[l], d));
+      }
+    }
+    if (!full) { r[0] = fx(r[0], fmul(w, pb)); r[1] = fx(r[1], fmul(w, pd)); }
+  }
+  reduce8(r, partials);
+}
+// Later coordinates (extension-field states): weight eq[2p] + eq[2p+1], base st[2p], delta st[2p] + st[2p+1].
+extern "C" __global__ void dw_rel_wide(const f256 *eq, const frow4 *st, uint64_t pairs, c4 cols, rc4 rc, int full, f256 *partials) {
+  f256 r[8];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) r[k] = FZ;
+  for (uint64_t p = GID; p < pairs; p += GSTRIDE) {
+    f256 w = fx(eq[2 * p], eq[2 * p + 1]); frow4 lo = st[2 * p], hi = st[2 * p + 1];
+    f256 pb = FZ, pd = FZ;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) {
+      f256 d = fx(lo.l[l], hi.l[l]);
+      if (full || l == 0) {
+        f256 a = lo.l[l]; a.lo = x(a.lo, rc.r[l]);
+        f256 c[8]; faff7(a, d, c);
+        f256 wc = fmul(w, cols.c[l]);
+        #pragma unroll
+        for (int k = 0; k < 8; k++) r[k] = fx(r[k], fmul(wc, c[k]));
+      } else {
+        pb = fx(pb, fmul(cols.c[l], lo.l[l])); pd = fx(pd, fmul(cols.c[l], d));
+      }
+    }
+    if (!full) { r[0] = fx(r[0], fmul(w, pb)); r[1] = fx(r[1], fmul(w, pd)); }
+  }
+  reduce8(r, partials);
+}
+// out[k] = XOR of partials[8*b + k] over b < nblocks (one block of 128 threads).
+extern "C" __global__ void dw_reduce_partials(const f256 *partials, uint64_t nblocks, f256 *out) {
+  f256 r[8];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) r[k] = FZ;
+  for (uint64_t b = threadIdx.x; b < nblocks; b += blockDim.x) {
+    #pragma unroll
+    for (int k = 0; k < 8; k++) r[k] = fx(r[k], partials[8 * b + k]);
+  }
+  __shared__ f256 s[8][128];
+  #pragma unroll
+  for (int k = 0; k < 8; k++) s[k][threadIdx.x] = r[k];
+  __syncthreads();
+  for (unsigned h = blockDim.x / 2; h > 0; h >>= 1) {
+    if (threadIdx.x < h) {
+      #pragma unroll
+      for (int k = 0; k < 8; k++) s[k][threadIdx.x] = fx(s[k][threadIdx.x], s[k][threadIdx.x + h]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < 8) out[threadIdx.x] = s[threadIdx.x][0];
+}
+// dst[i][l] = S[2i][l] + ch * (S[2i][l] + S[2i+1][l])   (base rows -> extension rows)
+extern "C" __global__ void dw_fold_base(frow4 *dst, const row4 *S, uint64_t half, f256 ch) {
+  for (uint64_t i = GID; i < half; i += GSTRIDE) {
+    row4 lo = S[2 * i], hi = S[2 * i + 1]; frow4 o;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) { f256 v = fscale(ch, x(lo.l[l], hi.l[l])); v.lo = x(v.lo, lo.l[l]); o.l[l] = v; }
+    dst[i] = o;
+  }
+}
+extern "C" __global__ void dw_fold4(frow4 *dst, const frow4 *st, uint64_t half, f256 ch) {
+  for (uint64_t i = GID; i < half; i += GSTRIDE) {
+    frow4 lo = st[2 * i], hi = st[2 * i + 1], o;
+    #pragma unroll
+    for (int l = 0; l < 4; l++) o.l[l] = fx(lo.l[l], fmul(ch, fx(lo.l[l], hi.l[l])));
+    dst[i] = o;
+  }
+}
