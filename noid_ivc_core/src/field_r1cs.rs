@@ -6095,6 +6095,13 @@ impl LincheckCircuit for CompactFieldR1cs {
         x_inner_rest: &[F256],
         k_skip: usize,
     ) -> Vec<F256> {
+        // amun: on the GPU when available (same matrix copy as the matrix-claim fold).
+        #[cfg(target_os = "linux")]
+        if let Some(combination) =
+            crate::matrix_claim::c1::amun_try_fold_alpha_quirky(self, alpha, z_skip, x_inner_rest, k_skip)
+        {
+            return combination;
+        }
         let n = self.k();
         let skip_size = 1usize << k_skip;
         let skip = crate::zerocheck::field_c1::lagrange_weights(k_skip, z_skip, 0);

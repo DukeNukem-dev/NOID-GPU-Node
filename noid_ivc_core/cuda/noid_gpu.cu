@@ -522,3 +522,25 @@ extern "C" __global__ void ntt_layer(u128 *data, uint64_t pairs, uint64_t num_nt
     data[top] = nu; data[bot] = x(v, nu);
   }
 }
+
+// ---------------------------------------------------------------- C1 lincheck alpha-batched column fold
+// comb[c] = sum over stacked rows s (A rows < width, B rows >= width) of w(r) * coef, w(r) = skip[r & smask] *
+// rest[r >> k_skip], times alpha on the A side. Load-balanced like colimage_bal; comb must be zeroed first.
+extern "C" __global__ void lincheck_fold_bal(const uint32_t *ecol, const uint32_t *srow, const uint32_t *ci, const u128 *dict,
+                                             uint64_t nnz, uint64_t k_log, const f256 *skip, uint64_t k_skip,
+                                             const f256 *rest, f256 alpha, f256 *comb) {
+  uint64_t wmask = (1ull << k_log) - 1, smask = (1ull << k_skip) - 1;
+  for (uint64_t t = GID; t * CH < nnz; t += GSTRIDE) {
+    uint64_t k0 = t * CH, k1 = min(k0 + CH, nnz);
+    uint32_t c = ecol[k0]; f256 acc = FZ;
+    for (uint64_t k = k0; k < k1; k++) {
+      uint32_t cc = ecol[k];
+      if (cc != c) { xor_into(&comb[c], acc); acc = FZ; c = cc; }
+      uint64_t s = srow[k], r = s & wmask;
+      f256 w = fmul(skip[r & smask], rest[r >> k_skip]);
+      if ((s >> k_log) == 0) w = fmul(alpha, w);
+      acc = fx(acc, fscale(w, dict[ci[k]]));
+    }
+    xor_into(&comb[c], acc);
+  }
+}

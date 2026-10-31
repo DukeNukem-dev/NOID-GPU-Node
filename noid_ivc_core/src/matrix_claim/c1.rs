@@ -811,6 +811,8 @@ impl MatrixFoldRows<'_> {
 #[cfg(target_os = "linux")]
 #[path = "c1_gpu.rs"]
 mod fold_gpu;
+#[cfg(target_os = "linux")]
+pub(crate) use fold_gpu::try_fold_alpha_quirky as amun_try_fold_alpha_quirky;
 
 /// amun: the fold on the GPU when available (identical proof and transcript), else on the CPU.
 fn prove_from_rows<Ch: Challenger>(

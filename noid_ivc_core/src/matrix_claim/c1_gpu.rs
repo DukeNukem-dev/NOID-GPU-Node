@@ -632,3 +632,122 @@ mod tests {
         }
     }
 }
+
+/// amun: the lincheck alpha-batched column fold `fold_alpha_batched_quirky_c1` of a compact matrix on the GPU
+/// (same matrix copy as the fold). `None`: use the CPU. `NOID_GPU_LINCHECK=0` disables it.
+pub(crate) fn try_fold_alpha_quirky(
+    r1cs: &CompactFieldR1cs,
+    alpha: F256,
+    z_skip: F256,
+    x_inner_rest: &[F256],
+    k_skip: usize,
+) -> Option<Vec<F256>> {
+    try_fold_alpha_quirky_min(r1cs, alpha, z_skip, x_inner_rest, k_skip, 16)
+}
+
+fn lincheck_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("NOID_GPU_LINCHECK").is_ok_and(|v| v == "0"))
+}
+
+static LINCHECK_BREAKER: Breaker = Breaker::new();
+
+fn try_fold_alpha_quirky_min(
+    r1cs: &CompactFieldR1cs,
+    alpha: F256,
+    z_skip: F256,
+    x_inner_rest: &[F256],
+    k_skip: usize,
+    min_k_log: usize,
+) -> Option<Vec<F256>> {
+    let width = r1cs.k();
+    let k_log = width.trailing_zeros() as usize;
+    if !lincheck_enabled() || LINCHECK_BREAKER.broken() || k_log < min_k_log.max(2) || k_skip > k_log
+        || x_inner_rest.len() != k_log - k_skip
+    {
+        return None;
+    }
+    let mut g = gpu::lock()?;
+    let mut st: Box<State> = match g.fold.take().and_then(|b| b.downcast::<State>().ok()) {
+        Some(s) => s,
+        None => Box::new(State { matrix: None, work: Work::default() }),
+    };
+    let result = (|| -> Result<Vec<F256>, String> {
+        let k = kernels(&g)?;
+        let f = g.function(c"lincheck_fold_bal")?;
+        let key = (r1cs.amun_statement_digest(), width);
+        if st.matrix.as_ref().is_none_or(|m| m.key != key) {
+            st.matrix = None;
+            st.matrix = Some(upload_matrix(&g, r1cs, width)?);
+        }
+        let m = st.matrix.as_ref().unwrap();
+        let w = &mut st.work;
+        let skip = lagrange_weights(k_skip, z_skip, 0);
+        let sp = g.ensure(&mut w.lambda, skip.len() * F)?;
+        g.htod(sp, &skip)?;
+        let rest = g.ensure(&mut w.inner, (width >> k_skip) * F)?;
+        eq_table(&g, &k, rest, x_inner_rest)?;
+        let comb = g.ensure(&mut w.h[0], width * F)?;
+        g.zero(comb, width * F)?;
+        let (mut ecol, mut srow, mut ci, mut dict) = (m.ecol.ptr, m.srow.ptr, m.csc_ci.ptr, m.dict.ptr);
+        let (mut nnz, mut kl, mut skp, mut ks, mut rst, mut al, mut out) =
+            (m.nnz as u64, k_log as u64, sp, k_skip as u64, rest, alpha, comb);
+        g.launch(
+            f,
+            grid((m.nnz as u64).div_ceil(32)),
+            BLOCK,
+            &mut [arg!(ecol), arg!(srow), arg!(ci), arg!(dict), arg!(nnz), arg!(kl), arg!(skp), arg!(ks), arg!(rst), arg!(al), arg!(out)],
+        )?;
+        let mut host = vec![F256::ZERO; width];
+        g.dtoh(&mut host, comb)?;
+        Ok(host)
+    })();
+    g.fold = Some(st);
+    match result {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("amun gpu lincheck: error, using CPU from now on ({e})");
+            LINCHECK_BREAKER.trip();
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod lincheck_tests {
+    use crate::field::{F128, F256};
+    use crate::field_r1cs::{CompactFieldR1cs, synthetic_satisfiable};
+    use crate::lincheck::LincheckCircuit;
+    use crate::proof::FieldShape;
+
+    fn value(seed: u64) -> F256 {
+        F256::new(F128::new(seed, seed.rotate_left(7)), F128::new(!seed, seed ^ 0xC1))
+    }
+
+    /// Needs a GPU; without one only the CPU path runs.
+    #[test]
+    fn gpu_lincheck_fold_matches_resident() {
+        for k_log in [8usize, 12, 14] {
+            let (relation, _) = synthetic_satisfiable(k_log, k_log, 0x11C + k_log as u64);
+            let mut artifact = Vec::new();
+            relation.write_artifact(&mut artifact).unwrap();
+            let compact = CompactFieldR1cs::open_packed(
+                artifact.into_boxed_slice(),
+                FieldShape::of(&relation),
+                relation.structural_statement_digest(),
+            )
+            .unwrap();
+            let k_skip = relation.k_skip;
+            let rest: Vec<F256> = (0..k_log - k_skip).map(|i| value(40 + i as u64)).collect();
+            let (alpha, z) = (value(7), value(9));
+            let cpu = relation.fold_alpha_batched_quirky_c1(alpha, z, &rest, k_skip);
+            match super::try_fold_alpha_quirky_min(&compact, alpha, z, &rest, k_skip, 0) {
+                Some(gpu) => {
+                    assert_eq!(gpu, cpu, "lincheck fold differs at k_log={k_log}");
+                    eprintln!("k_log={k_log}: gpu lincheck fold == resident cpu fold");
+                }
+                None => eprintln!("k_log={k_log}: no GPU, skipped"),
+            }
+        }
+    }
+}
