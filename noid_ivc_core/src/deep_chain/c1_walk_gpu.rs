@@ -40,6 +40,38 @@ struct C4([F256; STATE_SIZE]);
 #[derive(Clone, Copy)]
 struct Rc4([F128; STATE_SIZE]);
 
+/// Device descriptor layouts (must match noid_gpu.cu; field elements as [u64; 4] for 8-byte alignment).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct WDesc {
+    eq: u64,
+    st: u64,
+    pairs: u64,
+    cols: [[u64; 4]; STATE_SIZE],
+    eq_dst: u64,
+    st_dst: u64,
+    half: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EDesc {
+    buf: u64,
+    len: u64,
+    r: [u64; 4],
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct RDesc {
+    ck: u64,
+    n: u64,
+    win: u64,
+}
+const _: () = assert!(std::mem::size_of::<WDesc>() == 176 && std::mem::size_of::<EDesc>() == 48);
+
+fn raw(v: F256) -> [u64; 4] {
+    [v.lo.lo, v.lo.hi, v.hi.lo, v.hi.hi]
+}
+
 struct Kernels {
     checkpoints: CuFunction,
     window: CuFunction,
@@ -50,6 +82,13 @@ struct Kernels {
     fold4: CuFunction,
     fold: CuFunction,
     eq_step: CuFunction,
+    b_rel_first: CuFunction,
+    b_rel_wide: CuFunction,
+    b_reduce: CuFunction,
+    b_fold_first: CuFunction,
+    b_fold_wide: CuFunction,
+    b_eq_step: CuFunction,
+    b_window: CuFunction,
 }
 
 fn kernels(g: &Gpu) -> Result<Kernels, String> {
@@ -63,6 +102,13 @@ fn kernels(g: &Gpu) -> Result<Kernels, String> {
         fold4: g.function(c"dw_fold4")?,
         fold: g.function(c"fold")?,
         eq_step: g.function(c"eq_step")?,
+        b_rel_first: g.function(c"dwb_rel_first")?,
+        b_rel_wide: g.function(c"dwb_rel_wide")?,
+        b_reduce: g.function(c"dwb_reduce")?,
+        b_fold_first: g.function(c"dwb_fold_first")?,
+        b_fold_wide: g.function(c"dwb_fold_wide")?,
+        b_eq_step: g.function(c"dwb_eq_step")?,
+        b_window: g.function(c"dwb_window")?,
     })
 }
 
@@ -84,6 +130,10 @@ struct State {
     consts: DBuf,
     children: Vec<Child>,
     results: DBuf,
+    descs: DBuf,
+    edescs: DBuf,
+    rdescs: DBuf,
+    partials: DBuf,
 }
 
 fn grid(n: u64) -> u64 {
@@ -148,6 +198,10 @@ fn prepare(g: &mut Gpu, st: &mut State, k: &Kernels, base_states: &[&[Vec<F128>;
         g.launch(k.checkpoints, grid(nn), BLOCK, &mut [arg!(s0), arg!(nn), arg!(nc), arg!(rc), arg!(mds), arg!(out)])?;
     }
     g.ensure(&mut st.results, base_states.len() * 8 * F)?;
+    g.ensure(&mut st.descs, base_states.len() * std::mem::size_of::<WDesc>())?;
+    g.ensure(&mut st.edescs, base_states.len() * std::mem::size_of::<EDesc>())?;
+    g.ensure(&mut st.rdescs, base_states.len() * std::mem::size_of::<RDesc>())?;
+    g.ensure(&mut st.partials, base_states.len() * MAX_REL_BLOCKS as usize * 8 * F)?;
     g.sync()
 }
 
@@ -197,13 +251,19 @@ fn transcript<C: Challenger>(
         let base = (round / SPACING) * SPACING;
         if window_base != base {
             let len = SPACING.min(N_ROUNDS - base);
-            for (child, states) in base_states.iter().enumerate() {
-                let n = states[0].len();
-                let c = &st.children[child];
-                let (mut ck, mut nn, mut b, mut l, mut rcp, mut m, mut win) =
-                    (c.ckpt.ptr + ((base / SPACING) * n * ROW) as u64, n as u64, base as u64, len as u64, consts, mds, c.window.ptr);
-                g.launch(k.window, grid(nn), BLOCK, &mut [arg!(ck), arg!(nn), arg!(b), arg!(l), arg!(rcp), arg!(m), arg!(win)])?;
-            }
+            let rd: Vec<RDesc> = base_states
+                .iter()
+                .enumerate()
+                .map(|(child, states)| {
+                    let n = states[0].len();
+                    let c = &st.children[child];
+                    RDesc { ck: c.ckpt.ptr + ((base / SPACING) * n * ROW) as u64, n: n as u64, win: c.window.ptr }
+                })
+                .collect();
+            g.htod(st.rdescs.ptr, &rd)?;
+            let max_n = rd.iter().map(|r| r.n).max().unwrap();
+            let (mut dp, mut b, mut l, mut rcp, mut m) = (st.rdescs.ptr, base as u64, len as u64, consts, mds);
+            g.launch2(k.b_window, grid(max_n), n_children as u64, BLOCK, &mut [arg!(dp), arg!(b), arg!(l), arg!(rcp), arg!(m)])?;
             window_base = base;
         }
 
@@ -219,41 +279,72 @@ fn transcript<C: Challenger>(
                 tracks.push(Track { w, n, eq_cur: 0, st_cur: 0, len: 1, exhausted: Some((F256::ONE, s0.map(F256::from_base))) });
                 // Coordinate 0 uses the base-field state; keep it via the exhausted slot's F128 image.
             } else {
-                eq_table(g, k, c.eq[0].ptr, &groups[child].point[1..])?;
+                g.htod(c.eq[0].ptr, &[F256::ONE])?;
                 tracks.push(Track { w, n, eq_cur: 0, st_cur: 0, len: n, exhausted: None });
             }
+        }
+        // Equality tails eq(point[1..]) for every child, one step per launch.
+        for j in 0..max_w_log.saturating_sub(1) {
+            let ed: Vec<EDesc> = (0..n_children)
+                .map(|child| {
+                    let w = w_logs[child];
+                    if w >= 2 && j < w - 1 {
+                        EDesc { buf: st.children[child].eq[0].ptr, len: 1 << j, r: raw(groups[child].point[1 + j]) }
+                    } else {
+                        EDesc::default()
+                    }
+                })
+                .collect();
+            g.htod(st.edescs.ptr, &ed)?;
+            let mut dp = st.edescs.ptr;
+            g.launch2(k.b_eq_step, grid(1 << j), n_children as u64, BLOCK, &mut [arg!(dp)])?;
         }
 
         let mut round_coeffs = Vec::with_capacity(max_w_log);
         let mut point = Vec::with_capacity(max_w_log);
         for coordinate in 0..max_w_log {
             // GPU pair sums for every child that still has tables.
-            let mut launched = vec![false; n_children];
+            let mut descs = vec![WDesc::default(); n_children];
+            let mut max_pairs = 0u64;
             for (child, t) in tracks.iter().enumerate() {
                 if t.exhausted.is_some() {
                     continue;
                 }
                 let c = &st.children[child];
-                let mut cols = C4(columns[child]);
-                let mut rcv = rc;
-                let mut fl: i32 = i32::from(full);
-                let mut parts = c.partials.ptr;
                 let pairs = (t.len / 2) as u64;
-                let blocks = rel_blocks(pairs);
-                let mut pr = pairs;
-                if coordinate == 0 {
-                    let (mut eqp, mut sp) = (c.eq[0].ptr, c.window.ptr + ((round - base) * t.n * ROW) as u64);
-                    g.launch(k.rel_first, blocks, BLOCK, &mut [arg!(eqp), arg!(sp), arg!(pr), arg!(cols), arg!(rcv), arg!(fl), arg!(parts)])?;
+                max_pairs = max_pairs.max(pairs);
+                let cols = columns[child].map(raw);
+                descs[child] = if coordinate == 0 {
+                    WDesc {
+                        eq: c.eq[0].ptr,
+                        st: c.window.ptr + ((round - base) * t.n * ROW) as u64,
+                        pairs,
+                        cols,
+                        eq_dst: 0,
+                        st_dst: c.st[0].ptr,
+                        half: pairs,
+                    }
                 } else {
-                    let (mut eqp, mut sp) = (c.eq[t.eq_cur].ptr, c.st[t.st_cur].ptr);
-                    g.launch(k.rel_wide, blocks, BLOCK, &mut [arg!(eqp), arg!(sp), arg!(pr), arg!(cols), arg!(rcv), arg!(fl), arg!(parts)])?;
-                }
-                let (mut pp, mut nb, mut out) = (parts, blocks, results + (child * 8 * F) as u64);
-                g.launch(k.reduce, 1, BLOCK, &mut [arg!(pp), arg!(nb), arg!(out)])?;
-                launched[child] = true;
+                    WDesc {
+                        eq: c.eq[t.eq_cur].ptr,
+                        st: c.st[t.st_cur].ptr,
+                        pairs,
+                        cols,
+                        eq_dst: c.eq[1 - t.eq_cur].ptr,
+                        st_dst: c.st[1 - t.st_cur].ptr,
+                        half: pairs,
+                    }
+                };
             }
             let mut sums = vec![[F256::ZERO; WALK_DEGREE]; n_children];
-            if launched.iter().any(|&x| x) {
+            if max_pairs > 0 {
+                g.htod(st.descs.ptr, &descs)?;
+                let blocks = rel_blocks(max_pairs);
+                let (mut dp, mut rcv, mut fl, mut parts) = (st.descs.ptr, rc, i32::from(full), st.partials.ptr);
+                let f = if coordinate == 0 { k.b_rel_first } else { k.b_rel_wide };
+                g.launch2(f, blocks, n_children as u64, BLOCK, &mut [arg!(dp), arg!(rcv), arg!(fl), arg!(parts)])?;
+                let (mut pp, mut nb, mut out) = (st.partials.ptr, blocks, results);
+                g.launch2(k.b_reduce, n_children as u64, 1, BLOCK, &mut [arg!(pp), arg!(nb), arg!(out)])?;
                 g.dtoh(&mut sums, results)?;
             }
 
@@ -289,31 +380,27 @@ fn transcript<C: Challenger>(
             point.push(challenge);
             round_coeffs.push(wire);
 
-            // Folds.
+            // Folds: one launch for every child with tables, then host bookkeeping.
+            if max_pairs > 0 {
+                let (mut dp, mut ch) = (st.descs.ptr, challenge);
+                let f = if coordinate == 0 { k.b_fold_first } else { k.b_fold_wide };
+                g.launch2(f, grid(max_pairs), n_children as u64, BLOCK, &mut [arg!(dp), arg!(ch)])?;
+            }
             for (child, t) in tracks.iter_mut().enumerate() {
                 let c = &st.children[child];
-                if let Some((eq0, s)) = t.exhausted.as_mut() {
+                if let Some((eq0, _)) = t.exhausted.as_mut() {
                     *eq0 *= F256::ONE + challenge;
-                    let _ = s;
                     continue;
                 }
-                let mut ch = challenge;
-                let half = (t.len / 2) as u64;
-                let mut h = half;
+                let half = t.len / 2;
                 if coordinate == 0 {
-                    let (mut dst, mut src) = (c.st[0].ptr, c.window.ptr + ((round - base) * t.n * ROW) as u64);
-                    g.launch(k.fold_base, grid(half), BLOCK, &mut [arg!(dst), arg!(src), arg!(h), arg!(ch)])?;
                     t.st_cur = 0;
                     prefix[child] = F256::ONE + groups[child].point[0] + challenge;
                 } else {
-                    let (mut dst, mut src) = (c.eq[1 - t.eq_cur].ptr, c.eq[t.eq_cur].ptr);
-                    g.launch(k.fold, grid(half), BLOCK, &mut [arg!(dst), arg!(src), arg!(h), arg!(ch)])?;
-                    let (mut dst, mut src) = (c.st[1 - t.st_cur].ptr, c.st[t.st_cur].ptr);
-                    g.launch(k.fold4, grid(half), BLOCK, &mut [arg!(dst), arg!(src), arg!(h), arg!(ch)])?;
                     t.eq_cur = 1 - t.eq_cur;
                     t.st_cur = 1 - t.st_cur;
                 }
-                t.len = half as usize;
+                t.len = half;
                 if t.len == 1 {
                     let eq0: F256 = read(g, c.eq[t.eq_cur].ptr)?;
                     let s0: [F256; STATE_SIZE] = read(g, c.st[t.st_cur].ptr)?;

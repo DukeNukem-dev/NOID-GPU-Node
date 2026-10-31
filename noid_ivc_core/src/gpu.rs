@@ -201,6 +201,21 @@ impl Gpu {
         check(unsafe { (self.api.sync)() }, "cuCtxSynchronize")
     }
 
+    /// Launch `f` on a `gx` × `gy` grid of `block`-thread blocks.
+    pub fn launch2(&self, f: CuFunction, gx: u64, gy: u64, block: u32, args: &mut [*mut c_void]) -> Result<(), String> {
+        let gx = gx.clamp(1, 1 << 30) as c_uint;
+        let gy = gy.clamp(1, 65535) as c_uint;
+        check(
+            unsafe {
+                (self.api.launch)(
+                    f, gx, gy, 1, block, 1, 1, 0, std::ptr::null_mut(), args.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            },
+            "cuLaunchKernel",
+        )
+    }
+
     /// Launch `f` on `grid` blocks of `block` threads. `args` holds a pointer to each kernel argument.
     pub fn launch(&self, f: CuFunction, grid: u64, block: u32, args: &mut [*mut c_void]) -> Result<(), String> {
         let grid = grid.clamp(1, 1 << 30) as c_uint;
