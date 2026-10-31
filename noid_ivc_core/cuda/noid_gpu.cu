@@ -663,3 +663,52 @@ extern "C" __global__ void rel_fold_wide(const fdesc *d, uint64_t half, f256 ch)
 extern "C" __global__ void rel_gather0(const f256 *const *tabs, uint64_t n, f256 *out) {
   for (uint64_t i = GID; i < n; i += GSTRIDE) out[i] = tabs[i][0];
 }
+
+// ---------------------------------------------------------------- C1 shift discharge (relations/c1.rs), 3 nodes
+__device__ __forceinline__ void reduce3(f256 r[3], f256 *partials) {
+  __shared__ f256 s[3][128];
+  for (int k = 0; k < 3; k++) s[k][threadIdx.x] = r[k];
+  __syncthreads();
+  for (unsigned h = blockDim.x / 2; h > 0; h >>= 1) {
+    if (threadIdx.x < h) for (int k = 0; k < 3; k++) s[k][threadIdx.x] = fx(s[k][threadIdx.x], s[k][threadIdx.x + h]);
+    __syncthreads();
+  }
+  if (threadIdx.x < 3) partials[3 * blockIdx.x + threadIdx.x] = s[threadIdx.x][0];
+}
+extern "C" __global__ void shift_first(const f256 *kern, const u128 *col, uint64_t pairs, f256 *partials) {
+  f256 a[3] = {FZ, FZ, FZ};
+  for (uint64_t p = GID; p < pairs; p += GSTRIDE) {
+    f256 kb = kern[2 * p], kd = fx(kb, kern[2 * p + 1]);
+    u128 cb = col[2 * p], cd = x(cb, col[2 * p + 1]);
+    for (int k = 0; k < 3; k++) a[k] = fx(a[k], fscale(fx(kb, fscale(kd, nodec(k))), x(cb, mul(cd, nodec(k)))));
+  }
+  reduce3(a, partials);
+}
+extern "C" __global__ void shift_wide(const f256 *kern, const f256 *col, uint64_t pairs, f256 *partials) {
+  f256 a[3] = {FZ, FZ, FZ};
+  for (uint64_t p = GID; p < pairs; p += GSTRIDE) {
+    f256 kb = kern[2 * p], kd = fx(kb, kern[2 * p + 1]);
+    f256 cb = col[2 * p], cd = fx(cb, col[2 * p + 1]);
+    for (int k = 0; k < 3; k++) a[k] = fx(a[k], fmul(fx(kb, fscale(kd, nodec(k))), fx(cb, fscale(cd, nodec(k)))));
+  }
+  reduce3(a, partials);
+}
+extern "C" __global__ void shift_reduce(const f256 *partials, uint64_t nblocks, f256 *out) {
+  f256 r[3] = {FZ, FZ, FZ};
+  for (uint64_t b = threadIdx.x; b < nblocks; b += blockDim.x) for (int k = 0; k < 3; k++) r[k] = fx(r[k], partials[3 * b + k]);
+  __shared__ f256 s[3][128];
+  for (int k = 0; k < 3; k++) s[k][threadIdx.x] = r[k];
+  __syncthreads();
+  for (unsigned h = blockDim.x / 2; h > 0; h >>= 1) {
+    if (threadIdx.x < h) for (int k = 0; k < 3; k++) s[k][threadIdx.x] = fx(s[k][threadIdx.x], s[k][threadIdx.x + h]);
+    __syncthreads();
+  }
+  if (threadIdx.x < 3) out[threadIdx.x] = s[threadIdx.x][0];
+}
+// dst[i] = from_base(lo) + ch * (lo + hi) for one base-field column
+extern "C" __global__ void fold_base1(f256 *dst, const u128 *src, uint64_t half, f256 ch) {
+  for (uint64_t i = GID; i < half; i += GSTRIDE) {
+    u128 lo = src[2 * i], hi = src[2 * i + 1];
+    f256 v = fscale(ch, x(lo, hi)); v.lo = x(v.lo, lo); dst[i] = v;
+  }
+}

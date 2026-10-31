@@ -8,8 +8,9 @@
 //! `NOID_GPU_RELATION=0` disables it.
 
 use super::{
-    C1ColumnRelationProof, C1RelationTerm, ColRef, RELATION_DEGREE, RELATION_NODES, RelationColumns,
-    absorb_relation_header, build_eq_table, claimed_refs, distinct_refs, horner, interpolate_round,
+    C1ColumnRelationProof, C1RelationTerm, C1ShiftDischargeProof, ColRef, RELATION_DEGREE, RELATION_NODES,
+    RelationColumns, absorb_relation_header, absorb_shift_header, build_eq_table, claimed_refs, distinct_refs,
+    horner, interpolate_degree_two, interpolate_round,
 };
 use crate::challenger::Challenger;
 use crate::field::{F128, F256};
@@ -296,6 +297,118 @@ fn transcript<C: Challenger>(
     Ok((C1ColumnRelationProof { rounds, final_values: final_values.clone() }, point, final_values))
 }
 
+
+/// amun: power-of-two shift discharge (`prove_shift_discharge_pow2`) on the GPU; same transcript and proof.
+pub(super) fn try_prove_shift<C: Challenger>(
+    column: &[F128],
+    sigma: &[F256],
+    target: F256,
+    shift_log: usize,
+    channel: &mut C,
+    min_w_log: usize,
+) -> Option<(C1ShiftDischargeProof, Vec<F256>)> {
+    let width = column.len();
+    if !enabled() || BREAKER.broken() || !width.is_power_of_two() {
+        return None;
+    }
+    let w_log = width.trailing_zeros() as usize;
+    let shift = 1usize << shift_log;
+    if w_log < min_w_log.max(2) || sigma.len() != w_log || shift >= width {
+        return None;
+    }
+    let mut g = gpu::lock()?;
+    let mut st: Box<State> = match g.rel.take().and_then(|b| b.downcast::<State>().ok()) {
+        Some(s) => s,
+        None => Box::default(),
+    };
+    // Layout in the arena: kernel A (width), kernel B (width/2), column base (width F128), column A (width/2),
+    // column B (width/4), partials, out.
+    let (ka, kb, cb, ca, cbb) = (width * F, width / 2 * F, width * 16, width / 2 * F, (width / 4).max(1) * F);
+    let setup = (|| -> Result<[u64; 5], String> {
+        let base = g.ensure(&mut st.arena, ka + kb + cb + ca + cbb)?;
+        let p = [base, base + ka as u64, base + (ka + kb) as u64, base + (ka + kb + cb) as u64, base + (ka + kb + cb + ca) as u64];
+        let equality = build_eq_table(sigma);
+        let mut kernel = vec![F256::ZERO; width];
+        kernel[..width - shift].copy_from_slice(&equality[shift..]);
+        g.htod(p[0], &kernel)?;
+        g.htod(p[2], column)?;
+        g.ensure(&mut st.partials, MAX_BLOCKS as usize * 3 * F)?;
+        g.ensure(&mut st.out, 3 * F)?;
+        Ok(p)
+    })();
+    let p = match setup {
+        Ok(p) => p,
+        Err(e) => {
+            g.free(&mut st.arena);
+            if !e.contains("CUresult 2)") {
+                eprintln!("amun gpu shift: setup error, using CPU from now on ({e})");
+                BREAKER.trip();
+            }
+            g.rel = Some(st);
+            return None;
+        }
+    };
+    let run = (|| -> Result<(C1ShiftDischargeProof, Vec<F256>), String> {
+        let first = g.function(c"shift_first")?;
+        let wide = g.function(c"shift_wide")?;
+        let reduce = g.function(c"shift_reduce")?;
+        let fold = g.function(c"fold")?;
+        let fold1 = g.function(c"fold_base1")?;
+        absorb_shift_header(channel, target, sigma, shift_log);
+        let mut rounds = Vec::with_capacity(w_log);
+        let mut point = Vec::with_capacity(w_log);
+        let evals = |g: &Gpu, f: CuFunction, k: u64, c: u64, pairs: u64| -> Result<[F256; 3], String> {
+            let blocks = pairs.div_ceil(BLOCK as u64).clamp(1, MAX_BLOCKS);
+            let (mut kk, mut cc, mut pr, mut parts) = (k, c, pairs, st.partials.ptr);
+            g.launch(f, blocks, BLOCK, &mut [arg!(kk), arg!(cc), arg!(pr), arg!(parts)])?;
+            let (mut pp, mut nb, mut out) = (st.partials.ptr, blocks, st.out.ptr);
+            g.launch(reduce, 1, BLOCK, &mut [arg!(pp), arg!(nb), arg!(out)])?;
+            let mut ev = [F256::ZERO; 3];
+            g.dtoh(&mut ev, st.out.ptr)?;
+            Ok(ev)
+        };
+        let mut kcur = (p[0], p[1]);
+        let mut ccur = (p[3], p[4]);
+        let mut len = width;
+        for round in 0..w_log {
+            let pairs = (len / 2) as u64;
+            let ev = if round == 0 { evals(&g, first, kcur.0, p[2], pairs)? } else { evals(&g, wide, kcur.0, ccur.0, pairs)? };
+            let full = interpolate_degree_two(&ev);
+            let wire = [full[0], full[2]];
+            channel.observe_f256_slice(&wire);
+            let challenge = channel.sample_f256();
+            point.push(challenge);
+            rounds.push(wire);
+            let (mut d, mut s, mut h, mut ch) = (kcur.1, kcur.0, pairs, challenge);
+            g.launch(fold, grid(pairs), BLOCK, &mut [arg!(d), arg!(s), arg!(h), arg!(ch)])?;
+            kcur = (kcur.1, kcur.0);
+            if round == 0 {
+                let (mut d, mut s, mut h, mut ch) = (ccur.0, p[2], pairs, challenge);
+                g.launch(fold1, grid(pairs), BLOCK, &mut [arg!(d), arg!(s), arg!(h), arg!(ch)])?;
+            } else {
+                let (mut d, mut s, mut h, mut ch) = (ccur.1, ccur.0, pairs, challenge);
+                g.launch(fold, grid(pairs), BLOCK, &mut [arg!(d), arg!(s), arg!(h), arg!(ch)])?;
+                ccur = (ccur.1, ccur.0);
+            }
+            len /= 2;
+        }
+        let mut fv = [F256::ZERO];
+        g.dtoh(&mut fv, ccur.0)?;
+        let final_value = fv[0];
+        channel.observe_f256(final_value);
+        Ok((C1ShiftDischargeProof { rounds, final_value }, point))
+    })();
+    g.free(&mut st.arena);
+    g.rel = Some(st);
+    match run {
+        Ok(v) => Some(v),
+        Err(e) => {
+            BREAKER.trip();
+            panic!("amun gpu shift: failed after the transcript started ({e}); GPU relation prover disabled");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::*;
@@ -350,6 +463,28 @@ mod tests {
                     assert_eq!((gpu.1, gpu.2), (cpu.1, cpu.2), "point/values differ at w_log={w_log}");
                     assert_eq!(a.sample_f256(), b.sample_f256(), "transcript differs");
                     eprintln!("w_log={w_log} terms={n_terms}: gpu relation == cpu");
+                }
+                None => eprintln!("w_log={w_log}: no GPU, skipped"),
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_shift_matches_cpu() {
+        for (w_log, shift_log) in [(6usize, 0usize), (15, 0), (16, 1), (17, 0)] {
+            let mut rng = Rng(0xabc ^ w_log as u64);
+            let column: Vec<F128> = (0..1usize << w_log).map(|_| rng.f128()).collect();
+            let sigma: Vec<F256> = (0..w_log).map(|_| rng.f256()).collect();
+            let target = rng.f256();
+            let mut a = FsLaneChallenger::new_c1(b"amun-gpu-shift-test");
+            let cpu = prove_shift_discharge_pow2_cpu(&column, &sigma, target, shift_log, &mut a);
+            let mut b = FsLaneChallenger::new_c1(b"amun-gpu-shift-test");
+            match super::try_prove_shift(&column, &sigma, target, shift_log, &mut b, 0) {
+                Some(gpu) => {
+                    assert_eq!(gpu.0, cpu.0, "shift proof differs at w_log={w_log}");
+                    assert_eq!(gpu.1, cpu.1);
+                    assert_eq!(a.sample_f256(), b.sample_f256(), "transcript differs");
+                    eprintln!("w_log={w_log} shift_log={shift_log}: gpu shift == cpu");
                 }
                 None => eprintln!("w_log={w_log}: no GPU, skipped"),
             }

@@ -723,6 +723,21 @@ pub fn prove_shift_discharge_pow2<C: Challenger>(
     shift_log: usize,
     channel: &mut C,
 ) -> (C1ShiftDischargeProof, Vec<F256>) {
+    // amun: large shifts on the GPU when available (identical proof and transcript).
+    #[cfg(target_os = "linux")]
+    if let Some(out) = rel_gpu::try_prove_shift(column, sigma, target, shift_log, channel, 15) {
+        return out;
+    }
+    prove_shift_discharge_pow2_cpu(column, sigma, target, shift_log, channel)
+}
+
+fn prove_shift_discharge_pow2_cpu<C: Challenger>(
+    column: &[F128],
+    sigma: &[F256],
+    target: F256,
+    shift_log: usize,
+    channel: &mut C,
+) -> (C1ShiftDischargeProof, Vec<F256>) {
     let timing_started = std::time::Instant::now();
     let width = column.len();
     assert!(width.is_power_of_two(), "shift column width");
