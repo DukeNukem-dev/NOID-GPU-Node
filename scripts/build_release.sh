@@ -135,8 +135,8 @@ HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')
 case "$HOST_TRIPLE" in
   x86_64-unknown-linux-gnu)
     PLATFORM=linux-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64'
-    ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64 -C target-feature=+pclmulqdq,+aes'
+    ISA_PROFILE='portable x86-64 + PCLMULQDQ/AES control path; runtime AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-linux-x86_64.deb"
@@ -151,8 +151,8 @@ case "$HOST_TRIPLE" in
     ;;
   x86_64-pc-windows-msvc)
     PLATFORM=windows-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64'
-    ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64 -C target-feature=+pclmulqdq,+aes'
+    ISA_PROFILE='portable x86-64 + PCLMULQDQ/AES control path; runtime AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=.exe
     ARCHIVE_KIND=zip
     GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
@@ -167,8 +167,8 @@ case "$HOST_TRIPLE" in
     ;;
   x86_64-apple-darwin)
     PLATFORM=macos-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64'
-    ISA_PROFILE='portable Intel x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64 -C target-feature=+pclmulqdq,+aes'
+    ISA_PROFILE='portable Intel x86-64 + PCLMULQDQ/AES control path; runtime AVX2+VPCLMULQDQ'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
