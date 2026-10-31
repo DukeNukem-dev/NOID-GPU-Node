@@ -544,3 +544,122 @@ extern "C" __global__ void lincheck_fold_bal(const uint32_t *ecol, const uint32_
     xor_into(&comb[c], acc);
   }
 }
+
+// ---------------------------------------------------------------- C1 column-relation sumcheck (relations/c1.rs)
+// Terms: value(pair, node) = sum_t coeff_t * prod_{f in t} (base_f + delta_f * node), node in 0..4 (5 nodes).
+struct rterm { f256 coeff; uint32_t n; uint32_t f[3]; };
+#define RN 5
+__device__ __forceinline__ u128 nodec(int n) { return u128{(uint64_t)n, 0}; }
+// Block reduction of RN accumulators (blockDim 128).
+__device__ __forceinline__ void reduce5(f256 r[RN], f256 *partials) {
+  __shared__ f256 s[RN][128];
+  #pragma unroll
+  for (int k = 0; k < RN; k++) s[k][threadIdx.x] = r[k];
+  __syncthreads();
+  for (unsigned h = blockDim.x / 2; h > 0; h >>= 1) {
+    if (threadIdx.x < h) {
+      #pragma unroll
+      for (int k = 0; k < RN; k++) s[k][threadIdx.x] = fx(s[k][threadIdx.x], s[k][threadIdx.x + h]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < RN) partials[RN * blockIdx.x + threadIdx.x] = s[threadIdx.x][0];
+}
+// First round: base tables (F128), weight eq[pair] * eqf[node].
+extern "C" __global__ void rel_first(const u128 *const *tabs, const rterm *terms, uint32_t nterms, const f256 *eq,
+                                     uint64_t pairs, const f256 *eqf, f256 *partials) {
+  f256 acc[RN];
+  #pragma unroll
+  for (int k = 0; k < RN; k++) acc[k] = FZ;
+  for (uint64_t p = GID; p < pairs; p += GSTRIDE) {
+    f256 sum[RN];
+    #pragma unroll
+    for (int k = 0; k < RN; k++) sum[k] = FZ;
+    for (uint32_t t = 0; t < nterms; t++) {
+      rterm tm = terms[t];
+      u128 prod[RN];
+      #pragma unroll
+      for (int k = 0; k < RN; k++) prod[k] = u128{1, 0};
+      for (uint32_t j = 0; j < tm.n; j++) {
+        const u128 *tb = tabs[tm.f[j]];
+        u128 b = tb[2 * p], d = x(b, tb[2 * p + 1]);
+        #pragma unroll
+        for (int k = 0; k < RN; k++) prod[k] = mul(prod[k], x(b, mul(d, nodec(k))));
+      }
+      #pragma unroll
+      for (int k = 0; k < RN; k++) sum[k] = fx(sum[k], fscale(tm.coeff, prod[k]));
+    }
+    f256 e = eq[p];
+    #pragma unroll
+    for (int k = 0; k < RN; k++) acc[k] = fx(acc[k], fmul(fmul(e, eqf[k]), sum[k]));
+  }
+  reduce5(acc, partials);
+}
+// Later rounds: extension tables, weight eq_base + eq_delta * node.
+extern "C" __global__ void rel_wide(const f256 *const *tabs, const rterm *terms, uint32_t nterms, const f256 *eq,
+                                    uint64_t pairs, f256 *partials) {
+  f256 acc[RN];
+  #pragma unroll
+  for (int k = 0; k < RN; k++) acc[k] = FZ;
+  for (uint64_t p = GID; p < pairs; p += GSTRIDE) {
+    f256 sum[RN];
+    #pragma unroll
+    for (int k = 0; k < RN; k++) sum[k] = FZ;
+    for (uint32_t t = 0; t < nterms; t++) {
+      rterm tm = terms[t];
+      f256 prod[RN];
+      #pragma unroll
+      for (int k = 0; k < RN; k++) prod[k] = tm.coeff;
+      for (uint32_t j = 0; j < tm.n; j++) {
+        const f256 *tb = tabs[tm.f[j]];
+        f256 b = tb[2 * p], d = fx(b, tb[2 * p + 1]);
+        #pragma unroll
+        for (int k = 0; k < RN; k++) prod[k] = fmul(prod[k], fx(b, fscale(d, nodec(k))));
+      }
+      #pragma unroll
+      for (int k = 0; k < RN; k++) sum[k] = fx(sum[k], prod[k]);
+    }
+    f256 eb = eq[2 * p], ed = fx(eb, eq[2 * p + 1]);
+    #pragma unroll
+    for (int k = 0; k < RN; k++) acc[k] = fx(acc[k], fmul(fx(eb, fscale(ed, nodec(k))), sum[k]));
+  }
+  reduce5(acc, partials);
+}
+extern "C" __global__ void rel_reduce(const f256 *partials, uint64_t nblocks, f256 *out) {
+  f256 r[RN];
+  #pragma unroll
+  for (int k = 0; k < RN; k++) r[k] = FZ;
+  for (uint64_t b = threadIdx.x; b < nblocks; b += blockDim.x) {
+    #pragma unroll
+    for (int k = 0; k < RN; k++) r[k] = fx(r[k], partials[RN * b + k]);
+  }
+  __shared__ f256 s[RN][128];
+  #pragma unroll
+  for (int k = 0; k < RN; k++) s[k][threadIdx.x] = r[k];
+  __syncthreads();
+  for (unsigned h = blockDim.x / 2; h > 0; h >>= 1) {
+    if (threadIdx.x < h) {
+      #pragma unroll
+      for (int k = 0; k < RN; k++) s[k][threadIdx.x] = fx(s[k][threadIdx.x], s[k][threadIdx.x + h]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x < RN) out[threadIdx.x] = s[threadIdx.x][0];
+}
+// Fold every table (blockIdx.y = table): first round base -> extension, later extension -> extension.
+struct fdesc { const void *src; void *dst; };
+extern "C" __global__ void rel_fold_first(const fdesc *d, uint64_t half, f256 ch) {
+  const u128 *src = (const u128 *)d[blockIdx.y].src; f256 *dst = (f256 *)d[blockIdx.y].dst;
+  for (uint64_t i = GID; i < half; i += GSTRIDE) {
+    u128 lo = src[2 * i], hi = src[2 * i + 1];
+    f256 v = fscale(ch, x(lo, hi)); v.lo = x(v.lo, lo); dst[i] = v;
+  }
+}
+extern "C" __global__ void rel_fold_wide(const fdesc *d, uint64_t half, f256 ch) {
+  const f256 *src = (const f256 *)d[blockIdx.y].src; f256 *dst = (f256 *)d[blockIdx.y].dst;
+  for (uint64_t i = GID; i < half; i += GSTRIDE) { f256 lo = src[2 * i], hi = src[2 * i + 1]; dst[i] = fx(lo, fmul(ch, fx(lo, hi))); }
+}
+// out[i] = tabs[i][0]
+extern "C" __global__ void rel_gather0(const f256 *const *tabs, uint64_t n, f256 *out) {
+  for (uint64_t i = GID; i < n; i += GSTRIDE) out[i] = tabs[i][0];
+}

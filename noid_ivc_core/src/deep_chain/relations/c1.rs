@@ -336,7 +336,26 @@ impl CompiledRelation {
 }
 
 /// Prove one extension-field column relation over base-field columns.
+#[cfg(target_os = "linux")]
+#[path = "c1_rel_gpu.rs"]
+mod rel_gpu;
+
+/// amun: large relations on the GPU when available (identical proof and transcript), else on the CPU.
 pub fn prove_column_relation<C: Challenger>(
+    target: F256,
+    eq_point: &[F256],
+    terms: &[C1RelationTerm],
+    columns: &RelationColumns<'_>,
+    channel: &mut C,
+) -> (C1ColumnRelationProof, Vec<F256>, Vec<F256>) {
+    #[cfg(target_os = "linux")]
+    if let Some(out) = rel_gpu::try_prove(target, eq_point, terms, columns, channel, 15) {
+        return out;
+    }
+    prove_column_relation_cpu(target, eq_point, terms, columns, channel)
+}
+
+fn prove_column_relation_cpu<C: Challenger>(
     target: F256,
     eq_point: &[F256],
     terms: &[C1RelationTerm],
