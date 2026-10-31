@@ -162,6 +162,27 @@ impl FixedPattern {
     pub fn materialize(&self, w: usize) -> Vec<F128> {
         assert!(w >= self.table.len(), "domain below pattern period");
         let mask = self.table.len() - 1;
+        // amun: large domains are filled in parallel (same values).
+        if w >= 1 << 16 {
+            use rayon::prelude::*;
+            let gate = self.hi_gate.as_ref().map(|(first, bits)| {
+                assert_eq!(w, 1usize << (first + bits.len()), "gated pattern domain");
+                let gate_val = bits.iter().enumerate().fold(0usize, |g, (j, bit)| if *bit { g | 1 << j } else { g });
+                (*first, gate_val)
+            });
+            let mut out = vec![F128::ZERO; w];
+            out.par_chunks_mut(1 << 14).enumerate().for_each(|(c, chunk)| {
+                let base = c << 14;
+                for (k, v) in chunk.iter_mut().enumerate() {
+                    let i = base + k;
+                    *v = match gate {
+                        Some((first, gate_val)) if i >> first != gate_val => F128::ZERO,
+                        _ => self.table[i & mask],
+                    };
+                }
+            });
+            return out;
+        }
         match &self.hi_gate {
             None => (0..w).map(|i| self.table[i & mask]).collect(),
             Some((first, bits)) => {
