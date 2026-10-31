@@ -196,54 +196,86 @@ pub fn build_paired_merkle_update_columns(
         }
     }
 
-    let mut carry = [F128::ZERO; STATE_SIZE];
-    for slot in 0..w {
-        let local = slot & (PAIRED_UPDATE_STRIDE - 1);
-        let level = local / PAIRED_UPDATE_SLOTS_PER_LEVEL;
-        let role = local % PAIRED_UPDATE_SLOTS_PER_LEVEL;
-
-        // Odd E cells are bridge cells only.  Level-zero old-odd has no
-        // predecessor inside its update and remains canonical zero.
-        if role == 1 && level > 0 {
-            for lane in 0..2 {
-                e[lane][slot] = c[lane][slot - 2];
-            }
-        } else if role == 3 {
-            for lane in 0..2 {
-                e[lane][slot] = c[lane][slot - 2];
-            }
-        }
-
-        let raw = match role {
-            0 | 2 => {
-                let current_at = if level == 0 { slot } else { slot - 1 };
-                let direction = d[slot];
-                let left = |lane: usize| {
-                    (F128::ONE + direction) * e[lane][current_at] + direction * sib[lane][slot]
-                };
-                [left(0), left(1), iv_flat[0], iv_flat[1]]
-            }
-            1 | 3 => {
-                let even = slot - 1;
-                let current_at = if level == 0 { even } else { slot - 2 };
-                let direction = d[even];
-                let right = |lane: usize| {
-                    direction * e[lane][current_at] + (F128::ONE + direction) * sib[lane][even]
-                };
-                [carry[0] + right(0), carry[1] + right(1), carry[2], carry[3]]
-            }
-            _ => unreachable!(),
+    // amun: every dependency (carry, E bridges) stays inside one 64-slot update, so updates are built
+    // independently (in parallel) into local blocks and copied back in order; identical ghost updates are
+    // built once. Same values as the former single slot-ordered pass. NOID_PAR_PAIRED=0: sequential.
+    const S: usize = PAIRED_UPDATE_STRIDE;
+    struct Block {
+        c: [[F128; S]; STATE_SIZE],
+        e: [[F128; S]; 2],
+        s0: [[F128; S]; STATE_SIZE],
+    }
+    let build_block = |update: usize| -> Block {
+        let base = update * S;
+        let mut blk = Block {
+            c: [[F128::ZERO; S]; STATE_SIZE],
+            e: std::array::from_fn(|lane| std::array::from_fn(|i| e[lane][base + i])),
+            s0: [[F128::ZERO; S]; STATE_SIZE],
         };
-
-        let (amun_s0, mut state) = noid_ivc_core::deep_chain::amun_rounds_from_raw(raw);
-        for lane in 0..STATE_SIZE {
-            s0[lane][slot] = amun_s0[lane];
+        let mut carry = [F128::ZERO; STATE_SIZE];
+        for local in 0..S {
+            let slot = base + local;
+            let level = local / PAIRED_UPDATE_SLOTS_PER_LEVEL;
+            let role = local % PAIRED_UPDATE_SLOTS_PER_LEVEL;
+            if (role == 1 && level > 0) || role == 3 {
+                for lane in 0..2 {
+                    blk.e[lane][local] = blk.c[lane][local - 2];
+                }
+            }
+            let raw = match role {
+                0 | 2 => {
+                    let current_at = if level == 0 { local } else { local - 1 };
+                    let direction = d[slot];
+                    let left = |lane: usize| {
+                        (F128::ONE + direction) * blk.e[lane][current_at] + direction * sib[lane][slot]
+                    };
+                    [left(0), left(1), iv_flat[0], iv_flat[1]]
+                }
+                1 | 3 => {
+                    let even = slot - 1;
+                    let current_at = if level == 0 { local - 1 } else { local - 2 };
+                    let direction = d[even];
+                    let right = |lane: usize| {
+                        direction * blk.e[lane][current_at] + (F128::ONE + direction) * sib[lane][even]
+                    };
+                    [carry[0] + right(0), carry[1] + right(1), carry[2], carry[3]]
+                }
+                _ => unreachable!(),
+            };
+            let (amun_s0, state) = noid_ivc_core::deep_chain::amun_rounds_from_raw(raw);
+            for lane in 0..STATE_SIZE {
+                blk.s0[lane][local] = amun_s0[lane];
+                blk.c[lane][local] = state[lane];
+            }
+            carry = state;
         }
-        for lane in 0..STATE_SIZE {
-            s_out[lane][slot] = state[lane];
-            c[lane][slot] = state[lane];
+        blk
+    };
+    let par = {
+        static PAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PAR.get_or_init(|| !std::env::var("NOID_PAR_PAIRED").is_ok_and(|v| v == "0"))
+    };
+    let live = updates.len().min(capacity);
+    let blocks: Vec<Block> = {
+        use rayon::prelude::*;
+        let n_build = if live < capacity { live + 1 } else { live };
+        if par {
+            (0..n_build).into_par_iter().map(build_block).collect()
+        } else {
+            (0..n_build).map(build_block).collect()
         }
-        carry = state;
+    };
+    for update in 0..capacity {
+        let blk = &blocks[update.min(live)];
+        let base = update * S;
+        for lane in 0..STATE_SIZE {
+            c[lane][base..base + S].copy_from_slice(&blk.c[lane]);
+            s0[lane][base..base + S].copy_from_slice(&blk.s0[lane]);
+            s_out[lane][base..base + S].copy_from_slice(&blk.c[lane]);
+        }
+        for lane in 0..2 {
+            e[lane][base..base + S].copy_from_slice(&blk.e[lane]);
+        }
     }
 
     let mut roots_before = Vec::with_capacity(capacity);

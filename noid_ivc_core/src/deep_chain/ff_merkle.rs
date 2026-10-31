@@ -298,54 +298,106 @@ pub fn build_ff_merkle_path_columns(
         }
     }
 
-    let mut carry = [F128::ZERO; STATE_SIZE];
-    for slot in 0..w {
-        let local = slot & (stride - 1);
-        let path_idx = slot >> family.stride_log();
-        let in_family = path_idx < family.n_paths && local < family.depth;
-
-        let raw: [F128; STATE_SIZE] = if in_family {
-            let carried = if local == 0 {
-                paths[path_idx].entry
-            } else {
-                [cr[0][slot], cr[1][slot]]
-            };
-            cr[0][slot] = carried[0];
-            cr[1][slot] = carried[1];
-            let dv = d[slot];
-            let mix = |i: usize| carried[i] + dv * (carried[i] + sib[i][slot]);
-            let a = [mix(0), mix(1)];
-            let b0 = a[0] + carried[0] + sib[0][slot];
-            let b1 = a[1] + carried[1] + sib[1][slot];
-            [a[0], a[1], b0 + iv_flat[0], b1 + iv_flat[1]]
-        } else {
-            carry
+    // amun: each path's stride block depends only on itself (the carry into padding starts from the
+    // block's last node; the root copy into the next block's first slot is overwritten by that block),
+    // so blocks are built in parallel and the ghost tail chain runs after them. Same values as the former
+    // single slot-ordered pass. NOID_PAR_FFMERKLE=0: blocks built sequentially.
+    struct Block {
+        cr: [Vec<F128>; 2],
+        st0: [Vec<F128>; STATE_SIZE],
+        out: [Vec<F128>; STATE_SIZE],
+        root: Option<[F128; 2]>,
+    }
+    let n_slots = family.n_paths * stride;
+    let build_block = |p: usize| -> Block {
+        let base = p * stride;
+        let mut blk = Block {
+            cr: std::array::from_fn(|_| vec![F128::ZERO; stride]),
+            st0: std::array::from_fn(|_| vec![F128::ZERO; stride]),
+            out: std::array::from_fn(|_| vec![F128::ZERO; stride]),
+            root: None,
         };
-
-        let (st0, stout) = run_perm(raw);
+        let mut carry = [F128::ZERO; STATE_SIZE];
+        for local in 0..stride {
+            let slot = base + local;
+            let in_family = local < family.depth;
+            let raw: [F128; STATE_SIZE] = if in_family {
+                let carried = if local == 0 {
+                    paths[p].entry
+                } else {
+                    [blk.cr[0][local], blk.cr[1][local]]
+                };
+                blk.cr[0][local] = carried[0];
+                blk.cr[1][local] = carried[1];
+                let dv = d[slot];
+                let mix = |i: usize| carried[i] + dv * (carried[i] + sib[i][slot]);
+                let a = [mix(0), mix(1)];
+                let b0 = a[0] + carried[0] + sib[0][slot];
+                let b1 = a[1] + carried[1] + sib[1][slot];
+                [a[0], a[1], b0 + iv_flat[0], b1 + iv_flat[1]]
+            } else {
+                carry
+            };
+            let (st0, stout) = run_perm(raw);
+            for j in 0..STATE_SIZE {
+                blk.st0[j][local] = st0[j];
+                blk.out[j][local] = stout[j];
+            }
+            carry = stout;
+            if in_family {
+                let digest = [stout[0] + raw[0], stout[1] + raw[1]];
+                if local == family.depth - 1 {
+                    blk.root = Some(digest);
+                    if family.root_copy_offset().is_some() && local + 1 < stride {
+                        blk.cr[0][local + 1] = digest[0];
+                        blk.cr[1][local + 1] = digest[1];
+                    }
+                } else {
+                    blk.cr[0][local + 1] = digest[0];
+                    blk.cr[1][local + 1] = digest[1];
+                }
+            }
+        }
+        blk
+    };
+    let par = {
+        static PAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PAR.get_or_init(|| !std::env::var("NOID_PAR_FFMERKLE").is_ok_and(|v| v == "0"))
+    };
+    let blocks: Vec<Block> = if par {
+        use rayon::prelude::*;
+        (0..family.n_paths).into_par_iter().map(build_block).collect()
+    } else {
+        (0..family.n_paths).map(build_block).collect()
+    };
+    let mut carry = [F128::ZERO; STATE_SIZE];
+    for (p, blk) in blocks.into_iter().enumerate() {
+        let base = p * stride;
+        for i in 0..2 {
+            cr[i][base..base + stride].copy_from_slice(&blk.cr[i]);
+        }
+        for j in 0..STATE_SIZE {
+            s0[j][base..base + stride].copy_from_slice(&blk.st0[j]);
+            s_out[j][base..base + stride].copy_from_slice(&blk.out[j]);
+            c[j][base..base + stride].copy_from_slice(&blk.out[j]);
+        }
+        carry = std::array::from_fn(|j| blk.out[j][stride - 1]);
+        roots.push(blk.root.expect("every path has a root"));
+    }
+    // A root copy at the very last in-family node of the last path falls on the first tail slot.
+    if family.n_paths > 0 && family.depth == stride && family.root_copy_offset().is_some() && n_slots < w {
+        let last = roots[family.n_paths - 1];
+        cr[0][n_slots] = last[0];
+        cr[1][n_slots] = last[1];
+    }
+    for slot in n_slots..w {
+        let (st0, stout) = run_perm(carry);
         for j in 0..STATE_SIZE {
             s0[j][slot] = st0[j];
             s_out[j][slot] = stout[j];
             c[j][slot] = stout[j];
         }
         carry = stout;
-
-        if in_family {
-            let digest = [stout[0] + raw[0], stout[1] + raw[1]];
-            if local == family.depth - 1 {
-                roots.push(digest);
-                if family.root_copy_offset().is_some() {
-                    // The next slot is the spare tail selected by NODENS, so
-                    // the existing CR-chain relation proves this copy.
-                    cr[0][slot + 1] = digest[0];
-                    cr[1][slot + 1] = digest[1];
-                }
-            } else {
-                // The next node's carried-in digest.
-                cr[0][slot + 1] = digest[0];
-                cr[1][slot + 1] = digest[1];
-            }
-        }
     }
 
     FfMerklePathColumns {
