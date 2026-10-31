@@ -48,9 +48,11 @@ fn raw(v: F256) -> [u64; 4] {
 
 #[derive(Default)]
 struct State {
-    base: Vec<DBuf>,
-    a: Vec<DBuf>,
-    b: Vec<DBuf>,
+    /// One transient allocation per relation, carved into the per-column tables (freed after the relation).
+    arena: DBuf,
+    base: Vec<u64>,
+    a: Vec<u64>,
+    b: Vec<u64>,
     ptrs: DBuf,
     terms: DBuf,
     eq: [DBuf; 2],
@@ -116,14 +118,14 @@ pub(super) fn try_prove<C: Challenger>(
     let setup = (|| -> Result<Kernels, String> {
         let k = kernels(&g)?;
         let base_tables: Vec<Vec<F128>> = references.par_iter().map(|&reference| columns.resolve(reference, width)).collect();
-        st.base.resize_with(r, DBuf::default);
-        st.a.resize_with(r, DBuf::default);
-        st.b.resize_with(r, DBuf::default);
+        let (sb, sa, sbb) = (width * 16, width / 2 * F, (width / 4).max(1) * F);
+        let per = sb + sa + sbb;
+        let base_ptr = g.ensure(&mut st.arena, r * per)?;
+        st.base = (0..r).map(|i| base_ptr + (i * per) as u64).collect();
+        st.a = (0..r).map(|i| base_ptr + (i * per + sb) as u64).collect();
+        st.b = (0..r).map(|i| base_ptr + (i * per + sb + sa) as u64).collect();
         for (i, table) in base_tables.iter().enumerate() {
-            let p = g.ensure(&mut st.base[i], width * 16)?;
-            g.htod(p, table)?;
-            g.ensure(&mut st.a[i], width / 2 * F)?;
-            g.ensure(&mut st.b[i], (width / 4).max(1) * F)?;
+            g.htod(st.base[i], table)?;
         }
         let rterms: Vec<RTerm> = terms
             .iter()
@@ -154,13 +156,18 @@ pub(super) fn try_prove<C: Challenger>(
     let k = match setup {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("amun gpu relation: setup error, using CPU from now on ({e})");
-            BREAKER.trip();
+            // Out of GPU memory is not fatal: this relation runs on the CPU, later ones try again.
+            g.free(&mut st.arena);
+            if !e.contains("CUresult 2)") {
+                eprintln!("amun gpu relation: setup error, using CPU from now on ({e})");
+                BREAKER.trip();
+            }
             g.rel = Some(st);
             return None;
         }
     };
     let out = transcript(&g, &mut st, &k, target, eq_point, terms, &references, &claimed, width, channel);
+    g.free(&mut st.arena);
     g.rel = Some(st);
     match out {
         Ok(v) => Some(v),
@@ -200,7 +207,7 @@ fn transcript<C: Challenger>(
     };
 
     // Round 1 on the base tables.
-    let ptrs: Vec<u64> = st.base[..r].iter().map(|b| b.ptr).collect();
+    let ptrs: Vec<u64> = st.base[..r].to_vec();
     g.htod(st.ptrs.ptr, &ptrs)?;
     let pairs = (width / 2) as u64;
     let blocks = pairs.div_ceil(BLOCK as u64).clamp(1, MAX_BLOCKS);
@@ -221,7 +228,7 @@ fn transcript<C: Challenger>(
     rounds.push(wire);
     let equality_prefix = F256::ONE + eq_point[0] + challenge;
     {
-        let descs: Vec<FDesc> = (0..r).map(|i| FDesc { src: st.base[i].ptr, dst: st.a[i].ptr }).collect();
+        let descs: Vec<FDesc> = (0..r).map(|i| FDesc { src: st.base[i], dst: st.a[i] }).collect();
         g.htod(st.descs.ptr, &descs)?;
         let (mut dp, mut h, mut ch) = (st.descs.ptr, pairs, challenge);
         g.launch2(k.fold_first, grid(pairs), r as u64, BLOCK, &mut [arg!(dp), arg!(h), arg!(ch)])?;
@@ -231,7 +238,7 @@ fn transcript<C: Challenger>(
     let mut len = width / 2;
     for _ in 1..w_log {
         let half = (len / 2) as u64;
-        let cur: Vec<u64> = (0..r).map(|i| if in_a { st.a[i].ptr } else { st.b[i].ptr }).collect();
+        let cur: Vec<u64> = (0..r).map(|i| if in_a { st.a[i] } else { st.b[i] }).collect();
         g.htod(st.ptrs.ptr, &cur)?;
         let blocks = half.div_ceil(BLOCK as u64).clamp(1, MAX_BLOCKS);
         {
@@ -257,7 +264,7 @@ fn transcript<C: Challenger>(
             g.launch(k.fold, grid(half), BLOCK, &mut [arg!(dst), arg!(src), arg!(h), arg!(ch)])?;
             let descs: Vec<FDesc> = (0..r)
                 .map(|i| {
-                    let (s, d) = if in_a { (st.a[i].ptr, st.b[i].ptr) } else { (st.b[i].ptr, st.a[i].ptr) };
+                    let (s, d) = if in_a { (st.a[i], st.b[i]) } else { (st.b[i], st.a[i]) };
                     FDesc { src: s, dst: d }
                 })
                 .collect();
@@ -270,7 +277,7 @@ fn transcript<C: Challenger>(
         len /= 2;
     }
     let _ = claim;
-    let cur: Vec<u64> = (0..r).map(|i| if in_a { st.a[i].ptr } else { st.b[i].ptr }).collect();
+    let cur: Vec<u64> = (0..r).map(|i| if in_a { st.a[i] } else { st.b[i] }).collect();
     g.htod(st.ptrs.ptr, &cur)?;
     {
         let (mut tabs, mut n, mut out) = (st.ptrs.ptr, r as u64, st.out.ptr);

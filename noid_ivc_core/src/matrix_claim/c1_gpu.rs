@@ -565,8 +565,14 @@ fn try_prove_min<Ch: Challenger>(
         }
     };
     if let Err(e) = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming) {
-        eprintln!("amun gpu fold: setup error, using CPU from now on ({e})");
-        BREAKER.trip();
+        free_work(&g, &mut st.work);
+        // Out of GPU memory is not fatal: this fold runs on the CPU, the next one tries again.
+        if !e.contains("CUresult 2)") {
+            eprintln!("amun gpu fold: setup error, using CPU from now on ({e})");
+            BREAKER.trip();
+        } else {
+            eprintln!("amun gpu fold: out of GPU memory, this fold on the CPU");
+        }
         g.fold = Some(st);
         return None;
     }
