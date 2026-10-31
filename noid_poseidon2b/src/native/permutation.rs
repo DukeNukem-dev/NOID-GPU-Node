@@ -62,7 +62,17 @@ pub fn permute_flat_u128(flat: &mut [u128; STATE_SIZE]) {
             crate::batch_aarch64::permute_flat_single_u128(flat, crate::batch::kernel_tables())
         };
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::batch_pclmul::enabled() {
+        // SAFETY: enabled() requires the PCLMUL backend (PCLMULQDQ detected).
+        return unsafe { crate::batch_pclmul::permute_flat_single_u128(flat) };
+    }
     #[allow(unreachable_code)]
+    permute_flat_u128_generic(flat)
+}
+
+/// Portable reference schedule (used when no ISA kernel applies, and by kernel tests).
+pub fn permute_flat_u128_generic(flat: &mut [u128; STATE_SIZE]) {
     let tables = flat_tables();
 
     // Initial MDS_FULL multiplication.

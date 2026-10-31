@@ -664,6 +664,11 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
         // SAFETY: gated on runtime/static PMULL detection.
         return unsafe { crate::batch_aarch64::permute_flat_groups(states, kernel_tables()) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::batch_pclmul::enabled() {
+        // SAFETY: enabled() requires the PCLMUL backend (PCLMULQDQ detected).
+        return unsafe { crate::batch_pclmul::permute_flat_groups(states) };
+    }
     #[allow(unreachable_code)]
     {
         let tables = flat_tables();
@@ -712,6 +717,11 @@ pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE])
     if pmull_runtime() {
         // SAFETY: gated on runtime/static PMULL detection.
         return unsafe { crate::batch_aarch64::permute_flat_one(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if crate::batch_pclmul::enabled() {
+        // SAFETY: enabled() requires the PCLMUL backend (PCLMULQDQ detected).
+        return unsafe { crate::batch_pclmul::permute_flat_one(states) };
     }
     #[allow(unreachable_code)]
     let tables = flat_tables();

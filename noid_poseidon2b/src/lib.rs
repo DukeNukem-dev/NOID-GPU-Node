@@ -5,6 +5,8 @@
 //! UTXO-layer primitives, and hasher trait.
 
 pub mod batch;
+#[cfg(target_arch = "x86_64")]
+mod batch_pclmul;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod batch_aarch64;
 #[cfg(target_arch = "x86_64")]
