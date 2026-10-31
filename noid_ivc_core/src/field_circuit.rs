@@ -895,7 +895,8 @@ impl FieldR1csBuilder {
             checked_boolean_gates: std::collections::HashSet::new(),
             checked_boolean_gate_bytes: 0,
             boolean_pin_stats: self.boolean_pin_stats,
-            amun_fork_base: self.values.len(),
+            // A fork of a fork keeps the outer base: wires between it and the inner start belong to siblings.
+            amun_fork_base: if self.amun_fork_base > 0 { self.amun_fork_base } else { self.values.len() },
             amun_fork_pending0: self.pending_deferred_witness_slots,
             amun_fork_constraint0: (
                 self.pending_deferred_constraint_slots,
