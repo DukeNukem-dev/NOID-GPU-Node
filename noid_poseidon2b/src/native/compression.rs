@@ -299,6 +299,9 @@ mod hash_memo {
     struct Memo {
         map: HashMap<Vec<u8>, [u8; 32]>,
         bytes: usize,
+        /// Fingerprints of inputs seen once; an input is stored only on its second sighting, so
+        /// block-dependent one-off inputs never take memory. (Lookups always compare full bytes.)
+        seen: std::collections::HashSet<u64>,
     }
 
     static MEMO: OnceLock<Mutex<Memo>> = OnceLock::new();
@@ -329,7 +332,7 @@ mod hash_memo {
         compute: impl FnOnce() -> [u8; 32],
     ) -> [u8; 32] {
         let k = key(domain, pieces, total);
-        let memo = MEMO.get_or_init(|| Mutex::new(Memo { map: HashMap::new(), bytes: 0 }));
+        let memo = MEMO.get_or_init(|| Mutex::new(Memo { map: HashMap::new(), bytes: 0, seen: std::collections::HashSet::new() }));
         if let Ok(m) = memo.lock() {
             if let Some(d) = m.map.get(&k) {
                 HITS.fetch_add(1, Ordering::Relaxed);
@@ -346,6 +349,18 @@ mod hash_memo {
             );
         }
         if let Ok(mut m) = memo.lock() {
+            use std::hash::Hasher;
+            let fp = {
+                let mut f = std::collections::hash_map::DefaultHasher::new();
+                f.write(&k);
+                f.finish()
+            };
+            if m.seen.insert(fp) {
+                if m.seen.len() > 1 << 16 {
+                    m.seen.clear();
+                }
+                return d;
+            }
             if m.bytes + k.len() > BUDGET_BYTES {
                 m.map.clear();
                 m.bytes = 0;
