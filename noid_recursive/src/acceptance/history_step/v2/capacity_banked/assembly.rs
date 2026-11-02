@@ -108,6 +108,7 @@ fn prepare_assembly<const TIER: usize>(
         builder.enable_fused_boolean_pins();
     }
     let mut row_ledger = 0;
+    crate::acceptance::section_timer_start();
     let (cells, io_seal) =
         allocate_deferred_history_step_io(&mut builder, &runtime.bank.config().io_spec(), &io, ACC);
     let gate = cells[BASE].add_const(F128::ONE);
@@ -126,15 +127,23 @@ fn prepare_assembly<const TIER: usize>(
     });
     let (children, parents): (Vec<_>, Vec<_>) =
         scratch.into_iter().map(|s| (s.child, s.parent)).unzip();
-    let mut columns = prepare_history_step_parent_columns(
-        &mut builder,
-        &r_proofs,
-        selected.index(),
-        &runtime.parts.geometry,
-        children,
-        parents,
-    )?;
-    crate::acceptance::row_ledger_mark(&builder, &mut row_ledger, "bank: IO and parent columns");
+    let amun_diff = std::env::var_os("NOID_FORK_DIFF").is_some();
+    let amun_diff_inputs = amun_diff.then(|| (children.clone(), parents.clone()));
+    // amun: witness assembly fork (v2.1). Sections: A = parent columns, S = parent seal, B = block slots, P = pins,
+    // pre = roots/prev/selectors, C1 = arm Small, C2 = arms Large + Native (shared replay). A, S+B, C1, C2 only read
+    // wires below A, so after one sequential assembly per class they run on witness-only forks at the recorded
+    // offsets, merged in order; align + finalize then run on the merged builder.
+    let fork_wa = builder.num_wires();
+    let section_a = |builder: &mut FieldR1csBuilder| {
+        prepare_history_step_parent_columns(
+            builder,
+            &r_proofs,
+            selected.index(),
+            &runtime.parts.geometry,
+            children,
+            parents,
+        )
+    };
     let HistoryStepBlockInput {
         start_accumulator,
         end_accumulator,
@@ -144,173 +153,365 @@ fn prepare_assembly<const TIER: usize>(
         parent_header,
         ..
     } = current;
-    let parent_seal = ParentSealTrace::alloc(&mut builder, &parent_header);
-    let block = build_block_slots_selected_zk_prefix(
-        &mut builder,
-        &start_accumulator,
-        &end_accumulator,
-        &components,
-        &sealed_header,
-        TIER,
-        authorization,
-        &parent_header,
-        &parent_seal.block_id,
-        BlockRelationProfile::ScheduledV2(config),
-    );
-    pin_eq(
-        &mut builder,
-        &parent_seal.height,
-        &block.slots().start_acc.height,
-    );
-    pin_eq(
-        &mut builder,
-        &cells[ORIGIN_ACC],
-        &LinExpr::constant(flat_of(noid_core::Block128(
-            (config.activation_height() - 1) as u128,
-        ))),
-    );
-    crate::acceptance::row_ledger_mark(&builder, &mut row_ledger, "bank: complete block prefix");
-    let roots = envelopes
-        .iter()
-        .map(|e| alloc_flat_digest(&mut builder, &e.proof().commitment.root))
-        .collect::<Vec<_>>();
-    let prev = envelopes[selected.index()]
-        .proof()
-        .io
-        .iter()
-        .map(|v| LinExpr::from_wire(builder.alloc_f128(*v)))
-        .collect::<Vec<_>>();
-    let selectors = parent_selector(&mut builder, &prev[TIP_CLASS], selected);
-    // The entire ordered bank and sealed legacy boundary are inherited.
-    for index in BANK..POINT {
-        pin_eq(&mut builder, &cells[index], &prev[index]);
-    }
+    let section_sb = |builder: &mut FieldR1csBuilder| {
+        let seal_start = builder.num_wires();
+        let parent_seal = ParentSealTrace::alloc(&mut *builder, &parent_header);
+        let seal_size = builder.num_wires() - seal_start;
+        let block = build_block_slots_selected_zk_prefix(
+            &mut *builder,
+            &start_accumulator,
+            &end_accumulator,
+            &components,
+            &sealed_header,
+            TIER,
+            authorization,
+            &parent_header,
+            &parent_seal.block_id,
+            BlockRelationProfile::ScheduledV2(config),
+        );
+        (parent_seal, block, seal_size)
+    };
+    let c_pre = |builder: &mut FieldR1csBuilder| {
+        let roots = envelopes
+            .iter()
+            .map(|e| alloc_flat_digest(&mut *builder, &e.proof().commitment.root))
+            .collect::<Vec<_>>();
+        let prev = envelopes[selected.index()]
+            .proof()
+            .io
+            .iter()
+            .map(|v| LinExpr::from_wire(builder.alloc_f128(*v)))
+            .collect::<Vec<_>>();
+        let selectors = parent_selector(&mut *builder, &prev[TIP_CLASS], selected);
+        // The entire ordered bank and sealed legacy boundary are inherited.
+        for index in BANK..POINT {
+            pin_eq(&mut *builder, &cells[index], &prev[index]);
+        }
+        (roots, prev, selectors)
+    };
+    let c_arms = |builder: &mut FieldR1csBuilder,
+                  arms: &[Class],
+                  roots: &[_],
+                  prev: &[LinExpr],
+                  selectors: &[LinExpr; 3]|
+     -> Result<Vec<_>, V2Error> {
+        let mut out = Vec::new();
+        let mut shared = None;
+        let mut amun_ledger = 0;
+        for &arm in arms {
+            let slot = arm.index();
+            let entry = runtime.bank.config().class(arm);
+            let envelope = envelopes[slot].proof();
+            let arm_gate = mul(&mut *builder, &gate, &selectors[slot]);
+            let replay = if runtime.bank.config().shared_m24() && arm != Class::Small {
+                if arm == Class::Large {
+                    shared = Some(
+                        shared_parent::replay_shared(
+                            &mut *builder,
+                            runtime,
+                            selected,
+                            &gate,
+                            &selectors,
+                            &prev,
+                            &roots,
+                            &envelopes,
+                        )?
+                        .map(Some),
+                    );
+                }
+                shared.as_mut().ok_or(V2Error::Runtime)?[slot - 1]
+                    .take()
+                    .ok_or(V2Error::Runtime)?
+            } else {
+                let proof = C1FieldR1csProofTrace::alloc_shape_mode(
+                    &mut *builder,
+                    &envelope.field,
+                    &entry.shape(),
+                    &params[slot],
+                    false,
+                );
+                let mut arm_obligations = PcsWalkObligations::default();
+                let mut recorder = BaseSelectableParentRecorder::new_c1(PROOF_DOMAIN);
+                let mut child = None;
+                let mut error = None;
+                let (_, fresh) = with_pin_gate(&arm_gate, || {
+                    verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+                        &mut *builder,
+                        &mut recorder,
+                        &entry.shape(),
+                        &params[slot],
+                        &[
+                            prev[MATRIX + 2 * slot].clone(),
+                            prev[MATRIX + 2 * slot + 1].clone(),
+                        ],
+                        &roots[slot],
+                        &proof,
+                        &runtime.bank.config().io_spec(),
+                        &prev,
+                        &[
+                            prev[POST + 2 * slot].clone(),
+                            prev[POST + 2 * slot + 1].clone(),
+                        ],
+                        Some(&mut arm_obligations),
+                        |builder, context| match verify_joint_c1_region_sidecar_trace_post_commit(
+                            builder,
+                            context,
+                            &runtime.parts.parent_vk,
+                            runtime.parts.block_vk(arm),
+                            &envelope.sidecar,
+                        ) {
+                            Ok(recording) => child = Some(recording),
+                            Err(e) => error = Some(e),
+                        },
+                    )
+                });
+                if let Some(error) = error {
+                    return Err(error.into());
+                }
+                shared_parent::ArmReplay {
+                    fresh,
+                    obligations: arm_obligations,
+                    child: child.ok_or(V2Error::Layout)?,
+                    parent: recorder.finish(),
+                }
+            };
+            let shared_parent::ArmReplay {
+                fresh,
+                obligations: arm_obligations,
+                child,
+                parent,
+            } = replay;
+            out.push((arm_obligations, child, parent));
+            let lane = Lane::for_class(arm);
+            let incoming = C1MatrixAccClaimTrace {
+                point: prev[lane.point..lane.value]
+                    .chunks_exact(2)
+                    .map(|x| ExtExpr::new(x[0].clone(), x[1].clone()))
+                    .collect(),
+                value: ExtExpr::new(prev[lane.value].clone(), prev[lane.value + 1].clone()),
+            };
+            let fold = C1MatrixFoldProofTrace::alloc(&mut *builder, &folds[slot], entry.outer_m());
+            let mut channel = FsChannelTrace::new_c1(&mut *builder, FOLD_DOMAIN);
+            channel.observe_label(&mut *builder, ROUTE_DOMAIN);
+            channel.observe_lanes(&mut *builder, 1, std::slice::from_ref(&prev[TIP_CLASS]));
+            let outgoing = with_pin_gate(&arm_gate, || {
+                verify_matrix_claim_fold_c1_trace(
+                    &mut *builder,
+                    &mut channel,
+                    entry.shape().k_log,
+                    entry.shape().k_skip,
+                    &fresh,
+                    &incoming,
+                    &prev[lane.live],
+                    &fold,
+                )
+            });
+            bind_lane(&mut *builder, &cells, &prev, lane, &arm_gate, &outgoing);
+            crate::acceptance::row_ledger_mark(
+                &*builder,
+                &mut amun_ledger,
+                &format!("bank: parent verifier and fold {arm:?}"),
+            );
+            // A new origin cannot import an unchecked v2 matrix claim.
+            with_pin_gate(&cells[BASE], || {
+                for cell in &cells[lane.point..=lane.live] {
+                    pin_eq(&mut *builder, cell, &LinExpr::zero());
+                }
+            });
+        }
+        Ok(out)
+    };
+    let (parent_seal, block, prev, selectors, mut columns, arms) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
+        Some(((a_size, seal_size, b_size, p_size, pre_size, small_size, ln_size), snaps)) if amun_diff => {
+            let fail = super::amun_fork::fail;
+            let w_seal = fork_wa + a_size;
+            let w_block = w_seal + seal_size;
+            let start2 = w_block + b_size + p_size;
+            let w_ln = start2 + pre_size + small_size;
+            // Trial forks, taken and seeded exactly as the fork path does.
+            let mut fa = builder.amun_fork_witness_cached(fork_wa, &builder.amun_cache_snapshot()).map_err(fail)?;
+            let mut fc0 = builder.amun_fork_witness_cached(start2, &snaps.pre).map_err(fail)?;
+            let (t_roots, t_prev, t_selectors) = c_pre(&mut fc0);
+            let mut fc1 = fc0.amun_fork_witness_cached(w_ln, &snaps.ln).map_err(fail)?;
+            let columns = section_a(&mut builder)?;
+            let a_end = builder.num_wires();
+            crate::acceptance::row_ledger_mark(&builder, &mut row_ledger, "bank: IO and parent columns");
+            let snap_sb = builder.amun_cache_snapshot();
+            let (parent_seal, block, seal_size) = section_sb(&mut builder);
+            let snap_p = builder.amun_cache_snapshot();
+            let seal_end = a_end + seal_size;
+            let b_end = builder.num_wires();
+            pin_eq(&mut builder, &parent_seal.height, &block.slots().start_acc.height);
+            pin_eq(
+                &mut builder,
+                &cells[ORIGIN_ACC],
+                &LinExpr::constant(flat_of(noid_core::Block128((config.activation_height() - 1) as u128))),
+            );
+            let p_end = builder.num_wires();
+            crate::acceptance::row_ledger_mark(&builder, &mut row_ledger, "bank: complete block prefix");
+            let snap_pre = builder.amun_cache_snapshot();
+            let (roots, prev, selectors) = c_pre(&mut builder);
+            let pre_end = builder.num_wires();
+            let mut arms = c_arms(&mut builder, &[Class::Small], &roots, &prev, &selectors)?;
+            let small_end = builder.num_wires();
+            let snap_ln = builder.amun_cache_snapshot();
+            arms.extend(c_arms(&mut builder, &[Class::Large, Class::Native], &roots, &prev, &selectors)?);
+            let ln_end = builder.num_wires();
+            let snap_end = builder.amun_cache_snapshot();
+            // Trials (results discarded), then compare with the sequential witness.
+            let (ch, pa) = amun_diff_inputs.ok_or(V2Error::Layout)?;
+            let _ = prepare_history_step_parent_columns(&mut fa, &r_proofs, selected.index(), &runtime.parts.geometry, ch, pa)?;
+            let _ = c_arms(&mut fc0, &[Class::Small], &t_roots, &t_prev, &t_selectors)?;
+            let _ = c_arms(&mut fc1, &[Class::Large, Class::Native], &t_roots, &t_prev, &t_selectors)?;
+            let (sv, sf) = builder.amun_witness_view();
+            for (name, fork, lo, hi) in [
+                ("A parent columns", &fa, fork_wa, w_seal),
+                ("pre + C1 arm Small", &fc0, start2, w_ln),
+                ("C2 arms Large+Native", &fc1, w_ln, w_ln + ln_size),
+            ] {
+                let (fv, ff) = fork.amun_witness_view();
+                let mut count = 0usize;
+                let mut shown = 0;
+                for w in lo..hi {
+                    let (a, b) = (fv.get(w), sv.get(w));
+                    let (x, y) = (ff.get(w), sf.get(w));
+                    if a != b || x != y {
+                        count += 1;
+                        if shown < 8 {
+                            eprintln!("amun fork diff [{name}] wire {w} (+{}): fork {:?} flags {:?} / sequential {:?} flags {:?}", w - lo, a, x, b, y);
+                            shown += 1;
+                        }
+                    }
+                }
+                // flags below the section that the fork changed (a sequential section may clear flags of earlier wires)
+                let mut below = 0usize;
+                for w in 0..lo.min(ff.len()).min(sf.len()) {
+                    if ff[w] != sf[w] && w >= fork_wa {
+                        below += 1;
+                    }
+                }
+                eprintln!("amun fork diff [{name}]: wires {lo}..{hi} (fork len {}), {count} differ; earlier-wire flag differences {below}", fv.len());
+            }
+            let _ = fail("diff run finished (diagnostics only; this proof is sequential)");
+            (parent_seal, block, prev, selectors, columns, arms)
+        }
+        Some(((a_size, seal_size, b_size, p_size, pre_size, small_size, ln_size), snaps)) => {
+            let w_seal = fork_wa + a_size;
+            let w_block = w_seal + seal_size;
+            let start2 = w_block + b_size + p_size;
+            let w_ln = start2 + pre_size + small_size;
+            let fail = super::amun_fork::fail;
+            let mut fa = builder.amun_fork_witness_cached(fork_wa, &builder.amun_cache_snapshot()).map_err(fail)?;
+            let mut fs = builder.amun_fork_witness_cached(w_seal, &snaps.sb).map_err(fail)?;
+            let mut fc0 = builder.amun_fork_witness_cached(start2, &snaps.pre).map_err(fail)?;
+            let (roots, prev, selectors) = c_pre(&mut fc0);
+            if fc0.num_wires() != start2 + pre_size {
+                return Err(fail("pre-arm section size changed"));
+            }
+            let mut fc1 = fc0.amun_fork_witness_cached(w_ln, &snaps.ln).map_err(fail)?;
+            let amun_t = std::time::Instant::now();
+            let ((columns, (small, large_native)), (parent_seal, block, _)) = rayon::join(
+                || {
+                    rayon::join(
+                        || section_a(&mut fa),
+                        || {
+                            rayon::join(
+                                || {
+                                    crate::acceptance::trace::with_clean_pin_gates(|| {
+                                        c_arms(&mut fc0, &[Class::Small], &roots, &prev, &selectors)
+                                    })
+                                },
+                                || {
+                                    crate::acceptance::trace::with_clean_pin_gates(|| {
+                                        c_arms(&mut fc1, &[Class::Large, Class::Native], &roots, &prev, &selectors)
+                                    })
+                                },
+                            )
+                        },
+                    )
+                },
+                || crate::acceptance::trace::with_clean_pin_gates(|| section_sb(&mut fs)),
+            );
+            if super::amun_fork::trace() {
+                eprintln!("amun fork v2.1 trace: parallel part {:.0} ms", amun_t.elapsed().as_secs_f64() * 1e3);
+            }
+            let columns = columns?;
+            let mut arms = small?;
+            arms.extend(large_native?);
+            if fa.num_wires() != w_seal
+                || fs.num_wires() != w_block + b_size
+                || fc0.num_wires() != w_ln
+                || fc1.num_wires() != w_ln + ln_size
+            {
+                return Err(fail("a forked section changed size"));
+            }
+            builder.amun_join_witness(fa, fork_wa).map_err(fail)?;
+            builder.amun_join_witness(fs, w_seal).map_err(fail)?;
+            builder.amun_restore_caches(&snaps.p).map_err(fail)?;
+            pin_eq(&mut builder, &parent_seal.height, &block.slots().start_acc.height);
+            pin_eq(
+                &mut builder,
+                &cells[ORIGIN_ACC],
+                &LinExpr::constant(flat_of(noid_core::Block128((config.activation_height() - 1) as u128))),
+            );
+            if builder.num_wires() != start2 {
+                return Err(fail("pin section size changed"));
+            }
+            builder.amun_join_witness(fc0, start2).map_err(fail)?;
+            builder.amun_join_witness(fc1, w_ln).map_err(fail)?;
+            builder.amun_restore_caches(&snaps.end).map_err(fail)?;
+            builder.amun_apply_flags(&snaps.flag_changes).map_err(fail)?;
+            (parent_seal, block, prev, selectors, columns, arms)
+        }
+        None => {
+            let columns = section_a(&mut builder)?;
+            let a_end = builder.num_wires();
+            crate::acceptance::row_ledger_mark(&builder, &mut row_ledger, "bank: IO and parent columns");
+            let snap_sb = builder.amun_cache_snapshot();
+            let flags_a = builder.amun_witness_view().1.to_vec();
+            let (parent_seal, block, seal_size) = section_sb(&mut builder);
+            let snap_p = builder.amun_cache_snapshot();
+            let mut flag_changes = builder.amun_flag_changes(&flags_a, a_end);
+            let seal_end = a_end + seal_size;
+            let b_end = builder.num_wires();
+            pin_eq(&mut builder, &parent_seal.height, &block.slots().start_acc.height);
+            pin_eq(
+                &mut builder,
+                &cells[ORIGIN_ACC],
+                &LinExpr::constant(flat_of(noid_core::Block128((config.activation_height() - 1) as u128))),
+            );
+            let p_end = builder.num_wires();
+            crate::acceptance::row_ledger_mark(&builder, &mut row_ledger, "bank: complete block prefix");
+            let snap_pre = builder.amun_cache_snapshot();
+            let flags_p = builder.amun_witness_view().1.to_vec();
+            let (roots, prev, selectors) = c_pre(&mut builder);
+            let pre_end = builder.num_wires();
+            let mut arms = c_arms(&mut builder, &[Class::Small], &roots, &prev, &selectors)?;
+            let small_end = builder.num_wires();
+            let snap_ln = builder.amun_cache_snapshot();
+            flag_changes.extend(builder.amun_flag_changes(&flags_p, p_end));
+            let flags_s = builder.amun_witness_view().1.to_vec();
+            arms.extend(c_arms(&mut builder, &[Class::Large, Class::Native], &roots, &prev, &selectors)?);
+            let ln_end = builder.num_wires();
+            let snap_end = builder.amun_cache_snapshot();
+            flag_changes.extend(builder.amun_flag_changes(&flags_s, small_end));
+            super::amun_fork::record(
+                class.wire_id(),
+                TIER,
+                frozen,
+                (a_end - fork_wa, seal_end - a_end, b_end - seal_end, p_end - b_end, pre_end - p_end, small_end - pre_end, ln_end - small_end),
+                super::amun_fork::Snaps { sb: snap_sb, p: snap_p, pre: snap_pre, ln: snap_ln, end: snap_end, flag_changes },
+            );
+            (parent_seal, block, prev, selectors, columns, arms)
+        }
+    };
     let mut obligations = Vec::new();
     let mut recorded_children = Vec::new();
     let mut recorded_parents = Vec::new();
-    let mut shared = None;
-    for arm in Class::ALL {
-        let slot = arm.index();
-        let entry = runtime.bank.config().class(arm);
-        let envelope = envelopes[slot].proof();
-        let arm_gate = mul(&mut builder, &gate, &selectors[slot]);
-        let replay = if runtime.bank.config().shared_m24() && arm != Class::Small {
-            if arm == Class::Large {
-                shared = Some(
-                    shared_parent::replay_shared(
-                        &mut builder,
-                        runtime,
-                        selected,
-                        &gate,
-                        &selectors,
-                        &prev,
-                        &roots,
-                        &envelopes,
-                    )?
-                    .map(Some),
-                );
-            }
-            shared.as_mut().ok_or(V2Error::Runtime)?[slot - 1]
-                .take()
-                .ok_or(V2Error::Runtime)?
-        } else {
-            let proof = C1FieldR1csProofTrace::alloc_shape_mode(
-                &mut builder,
-                &envelope.field,
-                &entry.shape(),
-                &params[slot],
-                false,
-            );
-            let mut arm_obligations = PcsWalkObligations::default();
-            let mut recorder = BaseSelectableParentRecorder::new_c1(PROOF_DOMAIN);
-            let mut child = None;
-            let mut error = None;
-            let (_, fresh) = with_pin_gate(&arm_gate, || {
-                verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
-                    &mut builder,
-                    &mut recorder,
-                    &entry.shape(),
-                    &params[slot],
-                    &[
-                        prev[MATRIX + 2 * slot].clone(),
-                        prev[MATRIX + 2 * slot + 1].clone(),
-                    ],
-                    &roots[slot],
-                    &proof,
-                    &runtime.bank.config().io_spec(),
-                    &prev,
-                    &[
-                        prev[POST + 2 * slot].clone(),
-                        prev[POST + 2 * slot + 1].clone(),
-                    ],
-                    Some(&mut arm_obligations),
-                    |builder, context| match verify_joint_c1_region_sidecar_trace_post_commit(
-                        builder,
-                        context,
-                        &runtime.parts.parent_vk,
-                        runtime.parts.block_vk(arm),
-                        &envelope.sidecar,
-                    ) {
-                        Ok(recording) => child = Some(recording),
-                        Err(e) => error = Some(e),
-                    },
-                )
-            });
-            if let Some(error) = error {
-                return Err(error.into());
-            }
-            shared_parent::ArmReplay {
-                fresh,
-                obligations: arm_obligations,
-                child: child.ok_or(V2Error::Layout)?,
-                parent: recorder.finish(),
-            }
-        };
-        let shared_parent::ArmReplay {
-            fresh,
-            obligations: arm_obligations,
-            child,
-            parent,
-        } = replay;
-        obligations.push(arm_obligations);
-        recorded_children.push(child);
-        recorded_parents.push(parent);
-        let lane = Lane::for_class(arm);
-        let incoming = C1MatrixAccClaimTrace {
-            point: prev[lane.point..lane.value]
-                .chunks_exact(2)
-                .map(|x| ExtExpr::new(x[0].clone(), x[1].clone()))
-                .collect(),
-            value: ExtExpr::new(prev[lane.value].clone(), prev[lane.value + 1].clone()),
-        };
-        let fold = C1MatrixFoldProofTrace::alloc(&mut builder, &folds[slot], entry.outer_m());
-        let mut channel = FsChannelTrace::new_c1(&mut builder, FOLD_DOMAIN);
-        channel.observe_label(&mut builder, ROUTE_DOMAIN);
-        channel.observe_lanes(&mut builder, 1, std::slice::from_ref(&prev[TIP_CLASS]));
-        let outgoing = with_pin_gate(&arm_gate, || {
-            verify_matrix_claim_fold_c1_trace(
-                &mut builder,
-                &mut channel,
-                entry.shape().k_log,
-                entry.shape().k_skip,
-                &fresh,
-                &incoming,
-                &prev[lane.live],
-                &fold,
-            )
-        });
-        bind_lane(&mut builder, &cells, &prev, lane, &arm_gate, &outgoing);
-        crate::acceptance::row_ledger_mark(
-            &builder,
-            &mut row_ledger,
-            &format!("bank: parent verifier and fold {arm:?}"),
-        );
-        // A new origin cannot import an unchecked v2 matrix claim.
-        with_pin_gate(&cells[BASE], || {
-            for cell in &cells[lane.point..=lane.live] {
-                pin_eq(&mut builder, cell, &LinExpr::zero());
-            }
-        });
+    for (o, c, p) in arms {
+        obligations.push(o);
+        recorded_children.push(c);
+        recorded_parents.push(p);
     }
     if runtime.bank.config().shared_m24() {
         columns.align_shared_replay_hints(&builder, &recorded_children, &recorded_parents)?;

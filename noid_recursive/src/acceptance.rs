@@ -12,11 +12,35 @@ pub mod zk_auth_capsule_schedule;
 
 /// Optional row-accounting checkpoint used while freezing the four relation
 /// shapes. It has no effect unless explicitly enabled by release tooling.
+thread_local! {
+    static AMUN_SECTION_T: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn amun_section_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NOID_FORK_TRACE").is_ok_and(|v| v != "0"))
+}
+
+/// amun: start the section timer (NOID_FORK_TRACE=1); row_ledger_mark prints the time per section.
+pub(crate) fn section_timer_start() {
+    if amun_section_trace() {
+        AMUN_SECTION_T.with(|t| t.set(Some(std::time::Instant::now())));
+    }
+}
+
 pub(crate) fn row_ledger_mark(
     builder: &noid_ivc_core::field_circuit::FieldR1csBuilder,
     last: &mut usize,
     label: &str,
 ) {
+    if amun_section_trace() {
+        AMUN_SECTION_T.with(|t| {
+            if let Some(s) = t.get() {
+                eprintln!("[section] {label:<36} {:>6.0} ms", s.elapsed().as_secs_f64() * 1e3);
+                t.set(Some(std::time::Instant::now()));
+            }
+        });
+    }
     if std::env::var_os("NOID_ROW_LEDGER").is_some() {
         let now = builder.num_wires();
         eprintln!(

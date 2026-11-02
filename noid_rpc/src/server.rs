@@ -1676,7 +1676,10 @@ impl RpcHandler {
                 let verify_ms = started.elapsed().as_millis();
                 match result {
                     Ok(()) => tracing::info!(height = header.height, verify_ms, "amun shadow verify ok"),
-                    Err(error) => tracing::error!(height = header.height, verify_ms, %error, "amun shadow verify FAILED"),
+                    Err(error) => {
+                        tracing::error!(height = header.height, verify_ms, %error, "amun shadow verify FAILED");
+                        noid_recursive::amun_fork_disable();
+                    }
                 }
             });
         }

@@ -384,6 +384,20 @@ pub struct FieldR1csBuilder {
     amun_fork_constraint0: (usize, usize, usize, usize),
 }
 
+/// amun: recorded cross-section cache state of a builder (see `FieldR1csBuilder::amun_fork_witness_cached`).
+#[derive(Clone, Default)]
+pub struct AmunCacheSnap {
+    aliases: bool,
+    reuse: bool,
+    fused: bool,
+    constant_product_wires: std::collections::HashMap<u128, Wire>,
+    product_alias_stats: ProductAliasObservation,
+    checked_boolean_gates: std::collections::HashSet<SymbolicProductOperand>,
+    checked_boolean_gate_bytes: usize,
+    boolean_pin_stats: BooleanPinObservation,
+    reused_linear_pins: usize,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ProductAliasObservation {
     pub identity_reuses: usize,
@@ -412,7 +426,7 @@ pub struct BooleanPinObservation {
     pub constant_assertions_removed: usize,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct SymbolicProductOperand {
     constant: u128,
     terms: Vec<(u32, u128)>,
@@ -849,11 +863,89 @@ impl FieldR1csBuilder {
     /// them). Only for witness-only builders without the cross-section caches (product aliases, reused linear
     /// rows, fused boolean pins, product observer), where wire allocation depends only on the section itself.
     pub fn amun_fork_witness_at(&self, start: usize) -> Result<Self, &'static str> {
-        if self.record_rows {
-            return Err("fork needs a witness-only builder");
-        }
         if self.symbolic_product_aliases || self.reuse_linear_rows || self.fused_boolean_pins || self.product_observer.is_some() {
             return Err("fork needs the cross-section caches off");
+        }
+        self.amun_fork_inner(start)
+    }
+
+    /// amun: deferred-slot flags below `upto` that differ from `before` (a section's changes to earlier wires).
+    pub fn amun_flag_changes(&self, before: &[u8], upto: usize) -> Vec<(u32, u8)> {
+        let n = upto.min(before.len()).min(self.deferred_witness_slots.len());
+        (0..n)
+            .filter(|&w| before[w] != self.deferred_witness_slots[w])
+            .map(|w| (w as u32, self.deferred_witness_slots[w]))
+            .collect()
+    }
+
+    /// amun: set recorded deferred-slot flags (see [`Self::amun_flag_changes`]).
+    pub fn amun_apply_flags(&mut self, changes: &[(u32, u8)]) -> Result<(), &'static str> {
+        for &(w, f) in changes {
+            let slot = self.deferred_witness_slots.get_mut(w as usize).ok_or("recorded flag beyond the witness")?;
+            *slot = f;
+        }
+        Ok(())
+    }
+
+    /// amun: witness values and deferred-slot flags (fork diagnostics).
+    pub fn amun_witness_view(&self) -> (&[F128], &[u8]) {
+        (&self.values, &self.deferred_witness_slots)
+    }
+
+    /// amun: the cross-section cache state (product aliases, checked boolean gates, linear-row reuse count).
+    pub fn amun_cache_snapshot(&self) -> AmunCacheSnap {
+        AmunCacheSnap {
+            aliases: self.symbolic_product_aliases,
+            reuse: self.reuse_linear_rows,
+            fused: self.fused_boolean_pins,
+            constant_product_wires: self.constant_product_wires.clone(),
+            product_alias_stats: self.product_alias_stats,
+            checked_boolean_gates: self.checked_boolean_gates.clone(),
+            checked_boolean_gate_bytes: self.checked_boolean_gate_bytes,
+            boolean_pin_stats: self.boolean_pin_stats,
+            reused_linear_pins: self.reused_linear_pins,
+        }
+    }
+
+    /// amun: set the cross-section caches to a recorded state (same cache switches required).
+    pub fn amun_restore_caches(&mut self, s: &AmunCacheSnap) -> Result<(), &'static str> {
+        if (s.aliases, s.reuse, s.fused) != (self.symbolic_product_aliases, self.reuse_linear_rows, self.fused_boolean_pins) {
+            return Err("cache switches differ from the recorded state");
+        }
+        self.constant_product_wires = s.constant_product_wires.clone();
+        self.product_alias_stats = s.product_alias_stats;
+        self.checked_boolean_gates = s.checked_boolean_gates.clone();
+        self.checked_boolean_gate_bytes = s.checked_boolean_gate_bytes;
+        self.boolean_pin_stats = s.boolean_pin_stats;
+        self.reused_linear_pins = s.reused_linear_pins;
+        // Aliased constants may live on wires of sections this builder has not run (a fork): give those wires
+        // their value (the key is the constant itself), so reads through the alias see it.
+        for (&key, &wire) in &self.constant_product_wires {
+            let w = wire.0 as usize;
+            if w < self.values.len() {
+                self.values[w] = f128_from_u128(key);
+            }
+        }
+        Ok(())
+    }
+
+    /// amun: like [`Self::amun_fork_witness_at`], with the cross-section caches on and set to `caches` (the state the
+    /// section starting at `start` had in a sequential assembly).
+    pub fn amun_fork_witness_cached(&self, start: usize, caches: &AmunCacheSnap) -> Result<Self, &'static str> {
+        if self.product_observer.is_some() {
+            return Err("fork needs the product observer off");
+        }
+        let mut fork = self.amun_fork_inner(start)?;
+        fork.symbolic_product_aliases = self.symbolic_product_aliases;
+        fork.reuse_linear_rows = self.reuse_linear_rows;
+        fork.fused_boolean_pins = self.fused_boolean_pins;
+        fork.amun_restore_caches(caches)?;
+        Ok(fork)
+    }
+
+    fn amun_fork_inner(&self, start: usize) -> Result<Self, &'static str> {
+        if self.record_rows {
+            return Err("fork needs a witness-only builder");
         }
         if start < self.values.len() {
             return Err("fork start below the current wire count");

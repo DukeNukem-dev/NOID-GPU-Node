@@ -42,3 +42,16 @@ pub use accumulator::{
     genesis_accumulator, ChainAccumulator, ChainAccumulatorAdvanceError, ChainAccumulatorLaneError,
     ChainAccumulatorLocalBoundaryError, CHAIN_ACCUMULATOR_LANES,
 };
+
+/// amun: switch the forked (parallel) witness assembly off for this process, e.g. after a failed shadow verify.
+pub fn amun_fork_disable() {
+    if !AMUN_FORK_OFF.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("amun fork: switched off for this process");
+    }
+}
+
+pub(crate) fn amun_fork_disabled() -> bool {
+    AMUN_FORK_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static AMUN_FORK_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
