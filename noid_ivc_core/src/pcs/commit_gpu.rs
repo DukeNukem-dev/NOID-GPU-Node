@@ -100,8 +100,12 @@ pub(super) fn try_commit(z_packed: &[F128], mut codeword: Vec<F128>, params: &Pc
     g.merkle = bufs;
     drop(g);
     if let Err(e) = run {
-        eprintln!("amun gpu commit: error, using CPU from now on ({e})");
-        BREAKER.trip();
+        if e.contains("CUresult 2)") {
+            eprintln!("amun gpu commit: out of GPU memory, this commit on the CPU");
+        } else {
+            eprintln!("amun gpu commit: error, using CPU from now on ({e})");
+            BREAKER.trip();
+        }
         return Err(codeword);
     }
     let mut ok = true;

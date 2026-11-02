@@ -492,9 +492,14 @@ pub(super) fn try_prove<C: Challenger>(
         }
     };
     if let Err(e) = prepare(&mut g, &mut st, &k, base_states) {
-        eprintln!("amun gpu walk: setup error, using CPU from now on ({e})");
-        BREAKER.trip();
-        g.walk = Some(st);
+        if e.contains("CUresult 2)") {
+            drop(st);   // frees its device buffers
+            eprintln!("amun gpu walk: out of GPU memory, this walk on the CPU");
+        } else {
+            eprintln!("amun gpu walk: setup error, using CPU from now on ({e})");
+            BREAKER.trip();
+            g.walk = Some(st);
+        }
         return None;
     }
     let t1 = Instant::now();

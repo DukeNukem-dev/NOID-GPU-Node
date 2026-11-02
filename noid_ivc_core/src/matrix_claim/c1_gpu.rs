@@ -84,7 +84,10 @@ struct Work {
 }
 
 struct State {
-    matrix: Option<Matrix>,
+    /// Cached matrices, at most one per width.
+    matrices: Vec<Matrix>,
+    /// Index of the matrix the current fold uses.
+    cur: usize,
     work: Work,
 }
 
@@ -284,21 +287,8 @@ fn prepare(
     incoming: &C1MatrixAccClaim,
 ) -> Result<(), String> {
     let width = 1usize << k_log;
-    let key = (r1cs.amun_statement_digest(), width);
-    if st.matrix.as_ref().is_none_or(|m| m.key != key) {
-        if let Some(mut old) = st.matrix.take() {
-            for b in [&mut old.dict, &mut old.cp, &mut old.ecol, &mut old.srow, &mut old.csc_ci] {
-                g.free(b);
-            }
-            for s in 0..2 {
-                g.free(&mut old.rp[s]);
-                g.free(&mut old.col[s]);
-                g.free(&mut old.ci[s]);
-            }
-        }
-        st.matrix = Some(upload_matrix(g, r1cs, width)?);
-    }
-    let m = st.matrix.as_ref().unwrap();
+    st.cur = matrix_slot(g, st, r1cs, width)?;
+    let m = &st.matrices[st.cur];
     let w = &mut st.work;
     let rest_len = width >> k_skip;
     let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
@@ -363,7 +353,7 @@ fn transcript<Ch: Challenger>(
     channel: &mut Ch,
 ) -> Result<Output, String> {
     let width = 1usize << k_log;
-    let m = st.matrix.as_ref().unwrap();
+    let m = &st.matrices[st.cur];
     let w = &mut st.work;
     let partials = w.partials.ptr;
 
@@ -549,11 +539,12 @@ fn try_prove_min<Ch: Challenger>(
         return None;
     }
     let mut g = gpu::lock()?;
+    g.fold_trim = Some(trim_state);
     let timing = std::env::var_os("NOIDH_MATRIX_FOLD_TIMING").is_some();
     let t0 = Instant::now();
     let mut st: Box<State> = match g.fold.take().and_then(|b| b.downcast::<State>().ok()) {
         Some(s) => s,
-        None => Box::new(State { matrix: None, work: Work::default() }),
+        None => Box::new(State { matrices: Vec::new(), cur: 0, work: Work::default() }),
     };
     let k = match kernels(&g) {
         Ok(k) => k,
@@ -564,14 +555,23 @@ fn try_prove_min<Ch: Challenger>(
             return None;
         }
     };
-    if let Err(e) = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming) {
+    let mut res = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming);
+    if res.as_ref().is_err_and(|e| e.contains("CUresult 2)")) {
+        // Out of memory: free the other GPU users' caches and the other matrix, then try once more.
+        free_work(&g, &mut st.work);
+        g.evict_others();
+        st.matrices.retain(|m| m.width == 1usize << k_log);
+        res = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming);
+    }
+    if let Err(e) = res {
         free_work(&g, &mut st.work);
         // Out of GPU memory is not fatal: this fold runs on the CPU, the next one tries again.
         if !e.contains("CUresult 2)") {
             eprintln!("amun gpu fold: setup error, using CPU from now on ({e})");
             BREAKER.trip();
         } else {
-            eprintln!("amun gpu fold: out of GPU memory, this fold on the CPU");
+            let (free, total) = g.mem_mib();
+            eprintln!("amun gpu fold: out of GPU memory (k_log {k_log}, {free}/{total} MiB free), this fold on the CPU");
         }
         g.fold = Some(st);
         return None;
@@ -687,19 +687,82 @@ fn try_fold_alpha_quirky_min(
         return None;
     }
     let mut g = gpu::lock()?;
+    g.fold_trim = Some(trim_state);
     let mut st: Box<State> = match g.fold.take().and_then(|b| b.downcast::<State>().ok()) {
         Some(s) => s,
-        None => Box::new(State { matrix: None, work: Work::default() }),
+        None => Box::new(State { matrices: Vec::new(), cur: 0, work: Work::default() }),
     };
-    let result = (|| -> Result<Vec<F256>, String> {
+    let mut result = lincheck_once(&g, &mut st, r1cs, alpha, z_skip, x_inner_rest, k_skip, width, k_log);
+    if result.as_ref().is_err_and(|e| e.contains("CUresult 2)")) {
+        // Out of memory: free the other GPU users' caches and the other matrix, then try once more.
+        free_work(&g, &mut st.work);
+        g.evict_others();
+        st.matrices.retain(|m| m.width == width);
+        result = lincheck_once(&g, &mut st, r1cs, alpha, z_skip, x_inner_rest, k_skip, width, k_log);
+    }
+    free_work(&g, &mut st.work);
+    g.fold = Some(st);
+    match result {
+        Ok(v) => Some(v),
+        Err(e) if e.contains("CUresult 2)") => {
+            eprintln!("amun gpu lincheck: out of GPU memory (width {width}), this fold on the CPU");
+            None
+        }
+        Err(e) => {
+            eprintln!("amun gpu lincheck: error, using CPU from now on ({e})");
+            LINCHECK_BREAKER.trip();
+            None
+        }
+    }
+}
+
+/// Idle trim: keep only the smallest cached matrix (the common 2^23 one) and no work tables.
+fn trim_state(st: &mut Box<dyn std::any::Any + Send>) {
+    if let Some(s) = st.downcast_mut::<State>() {
+        if let Some(min) = s.matrices.iter().map(|m| m.width).min() {
+            s.matrices.retain(|m| m.width == min);
+        }
+        s.cur = 0;
+    }
+}
+
+/// The cached matrix for this statement and width: one cached matrix per width (proofs alternate 2^23 and 2^24),
+/// a stale one of the same width is replaced, and on out-of-memory the other cached matrices are dropped and the
+/// upload tried once more. Dropped matrices free their device memory.
+fn matrix_slot(g: &Gpu, st: &mut State, r1cs: &CompactFieldR1cs, width: usize) -> Result<usize, String> {
+    let key = (r1cs.amun_statement_digest(), width);
+    if let Some(i) = st.matrices.iter().position(|m| m.key == key) {
+        return Ok(i);
+    }
+    st.matrices.retain(|m| m.width != width);
+    let m = match upload_matrix(g, r1cs, width) {
+        Ok(m) => m,
+        Err(e) if e.contains("CUresult 2)") && !st.matrices.is_empty() => {
+            st.matrices.clear();
+            upload_matrix(g, r1cs, width)?
+        }
+        Err(e) => return Err(e),
+    };
+    st.matrices.push(m);
+    Ok(st.matrices.len() - 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lincheck_once(
+    g: &Gpu,
+    st: &mut State,
+    r1cs: &CompactFieldR1cs,
+    alpha: F256,
+    z_skip: F256,
+    x_inner_rest: &[F256],
+    k_skip: usize,
+    width: usize,
+    k_log: usize,
+) -> Result<Vec<F256>, String> {
         let k = kernels(&g)?;
         let f = g.function(c"lincheck_fold_bal")?;
-        let key = (r1cs.amun_statement_digest(), width);
-        if st.matrix.as_ref().is_none_or(|m| m.key != key) {
-            st.matrix = None;
-            st.matrix = Some(upload_matrix(&g, r1cs, width)?);
-        }
-        let m = st.matrix.as_ref().unwrap();
+        let mi = matrix_slot(g, st, r1cs, width)?;
+        let m = &st.matrices[mi];
         let w = &mut st.work;
         let skip = lagrange_weights(k_skip, z_skip, 0);
         let sp = g.ensure(&mut w.lambda, skip.len() * F)?;
@@ -720,17 +783,6 @@ fn try_fold_alpha_quirky_min(
         let mut host = vec![F256::ZERO; width];
         g.dtoh(&mut host, comb)?;
         Ok(host)
-    })();
-    free_work(&g, &mut st.work);
-    g.fold = Some(st);
-    match result {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("amun gpu lincheck: error, using CPU from now on ({e})");
-            LINCHECK_BREAKER.trip();
-            None
-        }
-    }
 }
 
 #[cfg(test)]

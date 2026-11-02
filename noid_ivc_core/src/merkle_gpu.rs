@@ -124,8 +124,13 @@ pub(super) fn try_merkle_tree(data: &[u8], num_leaves: usize, tree: &mut [Hash])
     }
     let mut g = gpu::lock()?;
     if let Err(e) = tree_on(&mut g, data, num_leaves, leaf_size, tree) {
-        eprintln!("amun gpu merkle: error, using CPU from now on ({e})");
-        BREAKER.trip();
+        if e.contains("CUresult 2)") {
+            g.evict_others();
+            eprintln!("amun gpu merkle: out of GPU memory, this tree on the CPU");
+        } else {
+            eprintln!("amun gpu merkle: error, using CPU from now on ({e})");
+            BREAKER.trip();
+        }
         return None;
     }
     drop(g);

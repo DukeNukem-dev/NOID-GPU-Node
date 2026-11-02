@@ -8,8 +8,10 @@
 //! `NOID_GPU=0` disables every GPU path.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 static FATBIN: &[u8] = include_bytes!("noid_gpu.fatbin");
 
@@ -33,13 +35,28 @@ pub(crate) struct Api {
     ) -> CuResult,
     sync: unsafe extern "C" fn() -> CuResult,
     get_function: unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult,
+    mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult,
 }
 
-/// Grow-only device buffer.
+/// Grow-only device buffer. Dropping it frees the device memory (drops happen under the GPU lock, where the
+/// context is current).
 #[derive(Default)]
 pub(crate) struct DBuf {
     pub ptr: DevPtr,
     pub cap: usize,
+}
+
+static MEM_FREE: OnceLock<unsafe extern "C" fn(DevPtr) -> CuResult> = OnceLock::new();
+
+impl Drop for DBuf {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            if let Some(f) = MEM_FREE.get() {
+                unsafe { f(self.ptr) };
+            }
+            self.ptr = 0;
+        }
+    }
 }
 
 pub(crate) struct Gpu {
@@ -52,6 +69,8 @@ pub(crate) struct Gpu {
     pub fold: Option<Box<dyn std::any::Any + Send>>,
     pub walk: Option<Box<dyn std::any::Any + Send>>,
     pub rel: Option<Box<dyn std::any::Any + Send>>,
+    /// Idle-trim hook for the fold state (set by the matrix fold; keeps its smallest cached matrix).
+    pub fold_trim: Option<fn(&mut Box<dyn std::any::Any + Send>)>,
 }
 // The raw CUDA handles are only used while holding the mutex.
 unsafe impl Send for Gpu {}
@@ -61,6 +80,7 @@ static GPU: OnceLock<Option<Mutex<Gpu>>> = OnceLock::new();
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flag: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn flock(fd: c_int, operation: c_int) -> c_int;
 }
 
 pub(crate) fn check(r: CuResult, what: &str) -> Result<(), String> {
@@ -99,7 +119,9 @@ fn init() -> Result<Gpu, String> {
             launch: sym(lib, c"cuLaunchKernel")?,
             sync: sym(lib, c"cuCtxSynchronize")?,
             get_function: sym(lib, c"cuModuleGetFunction")?,
+            mem_get_info: sym(lib, c"cuMemGetInfo_v2")?,
         };
+        let _ = MEM_FREE.set(api.mem_free);
         check(cu_init(0), "cuInit")?;
         let mut dev: CuDevice = 0;
         check(device_get(&mut dev, 0), "cuDeviceGet")?;
@@ -112,19 +134,119 @@ fn init() -> Result<Gpu, String> {
         check(module_load(&mut module, FATBIN.as_ptr().cast()), "cuModuleLoadData")?;
         let name = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
         eprintln!("amun gpu: enabled on {name}");
-        Ok(Gpu { api, ctx, module, name, merkle: Vec::new(), fold: None, walk: None, rel: None })
+        Ok(Gpu { api, ctx, module, name, merkle: Vec::new(), fold: None, walk: None, rel: None, fold_trim: None })
+    }
+}
+
+// ---- sharing one GPU between processes (amun Stage A)
+
+const LOCK_EX: c_int = 2;
+const LOCK_NB: c_int = 4;
+const LOCK_UN: c_int = 8;
+
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+static LAST_USE_MS: AtomicU64 = AtomicU64::new(0);
+static TRIMMED: AtomicBool = AtomicBool::new(true);
+
+fn now_ms() -> u64 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+struct XLock {
+    fd: c_int,
+    wait_ms: u64,
+}
+
+/// The machine-wide lock file (NOID_GPU_LOCK), shared by every node process that uses this GPU.
+fn xlock() -> Option<&'static XLock> {
+    static X: OnceLock<Option<XLock>> = OnceLock::new();
+    X.get_or_init(|| {
+        let path = std::env::var("NOID_GPU_LOCK").ok().filter(|p| !p.is_empty())?;
+        use std::os::fd::IntoRawFd;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)
+            .map_err(|e| eprintln!("amun gpu: lock file {path}: {e}; not sharing"))
+            .ok()?;
+        let wait_ms = std::env::var("NOID_GPU_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
+        eprintln!("amun gpu: shared with other processes through {path} (wait up to {wait_ms} ms)");
+        Some(XLock { fd: f.into_raw_fd(), wait_ms })
+    })
+    .as_ref()
+}
+
+/// Held GPU: the process mutex, plus the machine-wide lock when sharing. Dropping it releases both.
+pub(crate) struct GpuGuard {
+    g: MutexGuard<'static, Gpu>,
+    x: bool,
+}
+
+impl Deref for GpuGuard {
+    type Target = Gpu;
+    fn deref(&self) -> &Gpu {
+        &self.g
+    }
+}
+
+impl DerefMut for GpuGuard {
+    fn deref_mut(&mut self) -> &mut Gpu {
+        &mut self.g
+    }
+}
+
+impl Drop for GpuGuard {
+    fn drop(&mut self) {
+        LAST_USE_MS.store(now_ms(), Ordering::Relaxed);
+        TRIMMED.store(false, Ordering::Relaxed);
+        if self.x {
+            if let Some(l) = xlock() {
+                unsafe { flock(l.fd, LOCK_UN) };
+            }
+        }
+    }
+}
+
+/// Idle trim (NOID_GPU_IDLE_TRIM_MS > 0): free the cached buffers once the GPU has been idle that long.
+fn idle_trim_loop() {
+    let idle = std::env::var("NOID_GPU_IDLE_TRIM_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    if idle == 0 {
+        return;
+    }
+    let log = std::env::var_os("NOID_GPU_TRIM_LOG").is_some();
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if TRIMMED.load(Ordering::Relaxed) || now_ms().saturating_sub(LAST_USE_MS.load(Ordering::Relaxed)) < idle {
+            continue;
+        }
+        let Some(m) = GPU.get().and_then(|o| o.as_ref()) else { return };
+        let Ok(mut g) = m.try_lock() else { continue };
+        if unsafe { (g.api.ctx_set_current)(g.ctx) } != 0 {
+            continue;
+        }
+        g.evict_others();
+        if let Some(f) = g.fold_trim {
+            if let Some(st) = g.fold.as_mut() {
+                f(st);
+            }
+        }
+        TRIMMED.store(true, Ordering::Relaxed);
+        if log {
+            let (free, total) = g.mem_mib();
+            eprintln!("amun gpu: idle trim ({free}/{total} MiB free)");
+        }
     }
 }
 
 /// Try to take the GPU. `None`: no GPU, disabled, or busy (use the CPU path).
-pub(crate) fn lock() -> Option<MutexGuard<'static, Gpu>> {
+pub(crate) fn lock() -> Option<GpuGuard> {
     let gpu = GPU
         .get_or_init(|| {
             if std::env::var("NOID_GPU").is_ok_and(|v| v == "0") {
                 return None;
             }
             match init() {
-                Ok(g) => Some(Mutex::new(g)),
+                Ok(g) => {
+                    std::thread::Builder::new().name("amun-gpu-trim".into()).spawn(idle_trim_loop).ok();
+                    Some(Mutex::new(g))
+                }
                 Err(e) => {
                     eprintln!("amun gpu: disabled ({e})");
                     None
@@ -133,11 +255,23 @@ pub(crate) fn lock() -> Option<MutexGuard<'static, Gpu>> {
         })
         .as_ref()?;
     let g = gpu.try_lock().ok()?;
+    let mut x = false;
+    if let Some(l) = xlock() {
+        let t = Instant::now();
+        while unsafe { flock(l.fd, LOCK_EX | LOCK_NB) } != 0 {
+            if t.elapsed() >= Duration::from_millis(l.wait_ms) {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        x = true;
+    }
+    let guard = GpuGuard { g, x };
     // The context must be current on the calling thread.
-    if unsafe { (g.api.ctx_set_current)(g.ctx) } != 0 {
+    if unsafe { (guard.api.ctx_set_current)(guard.ctx) } != 0 {
         return None;
     }
-    Some(g)
+    Some(guard)
 }
 
 /// A disable switch per GPU user, set on the first error or self-check mismatch.
@@ -165,7 +299,8 @@ impl Gpu {
         if buf.cap < bytes {
             if buf.ptr != 0 {
                 unsafe { (self.api.mem_free)(buf.ptr) };
-                *buf = DBuf::default();
+                buf.ptr = 0;
+                buf.cap = 0;
             }
             check(unsafe { (self.api.mem_alloc)(&mut buf.ptr, bytes.max(256)) }, "cuMemAlloc")?;
             buf.cap = bytes.max(256);
@@ -177,7 +312,22 @@ impl Gpu {
         if buf.ptr != 0 {
             unsafe { (self.api.mem_free)(buf.ptr) };
         }
-        *buf = DBuf::default();
+        buf.ptr = 0;
+        buf.cap = 0;
+    }
+
+    /// Free the cached buffers of the other GPU users (merkle, walk, relation); they re-allocate on next use.
+    pub fn evict_others(&mut self) {
+        self.merkle.clear();
+        self.walk = None;
+        self.rel = None;
+    }
+
+    /// (free, total) device memory in MiB.
+    pub fn mem_mib(&self) -> (usize, usize) {
+        let (mut free, mut total) = (0usize, 0usize);
+        unsafe { (self.api.mem_get_info)(&mut free, &mut total) };
+        (free >> 20, total >> 20)
     }
 
     pub fn htod<T: Copy>(&self, dst: DevPtr, src: &[T]) -> Result<(), String> {
