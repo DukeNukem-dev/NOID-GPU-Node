@@ -907,6 +907,11 @@ impl FieldR1csBuilder {
         }
     }
 
+    /// amun: sizes of the cross-section caches (sanity check that a fork point matches a recorded one).
+    pub fn amun_cache_sizes(&self) -> (usize, usize, usize) {
+        (self.constant_product_wires.len(), self.checked_boolean_gates.len(), self.reused_linear_pins)
+    }
+
     /// amun: set the cross-section caches to a recorded state (same cache switches required).
     pub fn amun_restore_caches(&mut self, s: &AmunCacheSnap) -> Result<(), &'static str> {
         if (s.aliases, s.reuse, s.fused) != (self.symbolic_product_aliases, self.reuse_linear_rows, self.fused_boolean_pins) {
