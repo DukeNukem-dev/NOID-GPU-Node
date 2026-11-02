@@ -81,6 +81,12 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
                 return Err(V2Error::Boundary);
             }
             let selected = parsed.class;
+            // amun: the selected arm's replay + matrix fold and the two shape-only ghost arms are independent;
+            // run them in parallel. Errors keep the sequential order (selected arm first, then ghosts by class).
+            let amun_t = std::time::Instant::now();
+            let ghost_arms: Vec<Class> = Class::ALL.into_iter().filter(|arm| *arm != selected).collect();
+            let (selected_part, (ghost_0, ghost_1)) = rayon::join(
+                || -> Result<_, V2Error> {
             let (fresh, scratch) = replay(runtime, selected, &parent.proof)?;
             let incoming = parsed.claims[selected.index()].clone().unwrap_or_else(|| {
                 C1MatrixAccClaim::zero(runtime.bank.config().class(selected).outer_m())
@@ -106,6 +112,29 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
                 ),
             };
             drop(matrix);
+            Ok((scratch, fold, claim, amun_t.elapsed().as_secs_f64() * 1e3))
+                },
+                || {
+                    rayon::join(
+                        || {
+                            let t = std::time::Instant::now();
+                            (shape_only_arm(runtime, ghost_arms[0], parent.proof.io.clone()), t.elapsed().as_secs_f64() * 1e3)
+                        },
+                        || {
+                            let t = std::time::Instant::now();
+                            (shape_only_arm(runtime, ghost_arms[1], parent.proof.io.clone()), t.elapsed().as_secs_f64() * 1e3)
+                        },
+                    )
+                },
+            );
+            let (scratch, fold, claim, selected_ms) = selected_part?;
+            if super::amun_fork::trace() {
+                eprintln!(
+                    "amun prepare_parent: selected replay+fold {selected_ms:.0} ms, ghosts {:.0} / {:.0} ms, wall {:.0} ms",
+                    ghost_0.1, ghost_1.1, amun_t.elapsed().as_secs_f64() * 1e3
+                );
+            }
+            let mut ghosts = vec![Some(ghost_0.0?), Some(ghost_1.0?)];
             folds[selected.index()] = fold;
             let mut io = parent.proof.io.clone();
             install_claim(selected, &mut io, &claim)?;
@@ -120,7 +149,8 @@ pub(super) fn prepare_parent<'a, const TIER: usize>(
                     envelopes.push(ParentEnvelope::Persisted(&parent.proof));
                     scratches.push(selected_scratch.take().ok_or(V2Error::Runtime)?);
                 } else {
-                    let (ghost, scratch) = shape_only_arm(runtime, arm, parent.proof.io.clone())?;
+                    let slot = ghost_arms.iter().position(|a| *a == arm).ok_or(V2Error::Runtime)?;
+                    let (ghost, scratch) = ghosts[slot].take().ok_or(V2Error::Runtime)?;
                     envelopes.push(ParentEnvelope::Local(ghost));
                     scratches.push(scratch);
                 }
