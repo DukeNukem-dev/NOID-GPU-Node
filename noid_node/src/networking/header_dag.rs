@@ -134,7 +134,9 @@ impl HeaderDag {
 
     /// Attach exact-object availability to headers which already passed the
     /// native consensus path. A peer can never introduce a header through this
-    /// API and at most a bounded provider set is retained per header.
+    /// API. Each header keeps at most 16 providers. One full header used to
+    /// reject the whole batch, which dropped the new tip's objects whenever
+    /// an older header in the same message was already popular.
     pub fn advertise_inventory(
         &mut self,
         peer: PeerId,
@@ -149,16 +151,14 @@ impl HeaderDag {
             if header.header != record.header {
                 return Err(HeaderDagError::InventoryHeaderMismatch);
             }
-            if self.inventories.get(&hash).is_some_and(|providers| {
-                !providers.contains_key(&peer) && providers.len() >= MAX_PROVIDERS_PER_HEADER
-            }) {
-                return Err(HeaderDagError::InventoryProviderCapacity);
-            }
         }
         let mut inserted = 0usize;
         for record in records {
             let hash = block_id(&record.header);
             let providers = self.inventories.entry(hash).or_default();
+            if !providers.contains_key(&peer) && providers.len() >= MAX_PROVIDERS_PER_HEADER {
+                continue;
+            }
             if providers.insert(peer, *record) != Some(*record) {
                 inserted = inserted.saturating_add(1);
             }
@@ -704,6 +704,31 @@ mod tests {
 
         dag.remove_inventory_provider(terminal_peer);
         assert!(dag.terminal_provider(second.point(), None).is_none());
+    }
+
+    #[test]
+    fn saturated_header_does_not_drop_later_headers_in_the_batch() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 16);
+        let first = child(genesis, [1; 32], 1);
+        let second = child(first.header, first.cumulative_work, 2);
+        dag.insert(first).unwrap();
+        dag.insert(second).unwrap();
+        for _ in 0..16 {
+            dag.advertise_inventory(PeerId::random(), &[inventory(first, 1, false)])
+                .unwrap();
+        }
+        let late = PeerId::random();
+        let added = dag
+            .advertise_inventory(
+                late,
+                &[inventory(first, 3, false), inventory(second, 4, true)],
+            )
+            .unwrap();
+        assert_eq!(added, 1);
+        assert!(dag.inventory_for_provider(late, &[first])[0].body.is_none());
+        assert!(dag.inventory_for_provider(late, &[second])[0].terminal.is_some());
     }
 
     #[test]
