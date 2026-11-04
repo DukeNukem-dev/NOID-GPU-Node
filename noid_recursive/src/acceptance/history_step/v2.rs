@@ -275,6 +275,7 @@ impl AcceptedV2Terminal {
     }
 }
 
+#[derive(Clone)]
 struct Scratch {
     child: LayoutRecordedChannel,
     parent: LayoutRecordedChannel,

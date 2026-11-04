@@ -111,6 +111,28 @@ fn prepare_assembly<const TIER: usize>(
     crate::acceptance::section_timer_start();
     let (cells, io_seal) =
         allocate_deferred_history_step_io(&mut builder, &runtime.bank.config().io_spec(), &io, ACC);
+    if runtime.bank.config().activation_height() == 1 {
+        let genesis = noid_chain::consensus::genesis_header();
+        let genesis_id = digest_lanes(&noid_chain::hash_block_header(&genesis));
+        for (index, value) in genesis_id.into_iter().enumerate() {
+            pin_eq(
+                &mut builder,
+                &cells[ORIGIN_ID + index],
+                &LinExpr::constant(flat_of(value)),
+            );
+        }
+        for (index, value) in crate::accumulator::genesis_accumulator()
+            .to_lanes()
+            .into_iter()
+            .enumerate()
+        {
+            pin_eq(
+                &mut builder,
+                &cells[ORIGIN_ACC + index],
+                &LinExpr::constant(flat_of(value)),
+            );
+        }
+    }
     let gate = cells[BASE].add_const(F128::ONE);
     let boolean = mul(&mut builder, &cells[BASE], &gate);
     pin_eq(&mut builder, &boolean, &LinExpr::zero());
@@ -321,7 +343,11 @@ fn prepare_assembly<const TIER: usize>(
         }
         Ok(out)
     };
-    let (parent_seal, block, prev, selectors, mut columns, arms) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
+    enum AmunStep<C, A, P> {
+        Later(C, A),
+        Early(P),
+    }
+    let (parent_seal, block, prev, selectors, step) = match super::amun_fork::plan(class.wire_id(), TIER, frozen) {
         Some(((a_size, seal_size, b_size, p_size, pre_size, small_size, ln_size), snaps)) if amun_diff => {
             let fail = super::amun_fork::fail;
             let w_seal = fork_wa + a_size;
@@ -393,7 +419,7 @@ fn prepare_assembly<const TIER: usize>(
                 eprintln!("amun fork diff [{name}]: wires {lo}..{hi} (fork len {}), {count} differ; earlier-wire flag differences {below}", fv.len());
             }
             let _ = fail("diff run finished (diagnostics only; this proof is sequential)");
-            (parent_seal, block, prev, selectors, columns, arms)
+            (parent_seal, block, prev, selectors, AmunStep::Later(columns, arms))
         }
         Some(((a_size, seal_size, b_size, p_size, pre_size, small_size, ln_size), snaps)) => {
             let w_seal = fork_wa + a_size;
@@ -401,48 +427,144 @@ fn prepare_assembly<const TIER: usize>(
             let start2 = w_block + b_size + p_size;
             let w_ln = start2 + pre_size + small_size;
             let fail = super::amun_fork::fail;
-            let mut fa = builder.amun_fork_witness_cached(fork_wa, &builder.amun_cache_snapshot()).map_err(fail)?;
+            // S+B is the long section. Start it, then take the other forks and run c_pre on this
+            // thread (it must see this thread's pin-gate stack) while S+B is already running.
             let mut fs = builder.amun_fork_witness_cached(w_seal, &snaps.sb).map_err(fail)?;
-            let mut fc0 = builder.amun_fork_witness_cached(start2, &snaps.pre).map_err(fail)?;
-            let (roots, prev, selectors) = c_pre(&mut fc0);
-            if fc0.num_wires() != start2 + pre_size {
-                return Err(fail("pre-arm section size changed"));
-            }
-            let mut fc1 = fc0.amun_fork_witness_cached(w_ln, &snaps.ln).map_err(fail)?;
             let amun_t = std::time::Instant::now();
-            let ((columns, (small, large_native)), (parent_seal, block, _)) = rayon::join(
-                || {
-                    rayon::join(
-                        || section_a(&mut fa),
-                        || {
-                            rayon::join(
-                                || {
-                                    crate::acceptance::trace::with_clean_pin_gates(|| {
-                                        c_arms(&mut fc0, &[Class::Small], &roots, &prev, &selectors)
-                                    })
-                                },
-                                || {
-                                    crate::acceptance::trace::with_clean_pin_gates(|| {
-                                        c_arms(&mut fc1, &[Class::Large, Class::Native], &roots, &prev, &selectors)
-                                    })
-                                },
-                            )
-                        },
-                    )
-                },
-                || crate::acceptance::trace::with_clean_pin_gates(|| section_sb(&mut fs)),
-            );
-            if super::amun_fork::trace() {
-                eprintln!("amun fork v2.1 trace: parallel part {:.0} ms", amun_t.elapsed().as_secs_f64() * 1e3);
-            }
-            let columns = columns?;
-            let mut arms = small?;
-            arms.extend(large_native?);
-            if fa.num_wires() != w_seal
-                || fs.num_wires() != w_block + b_size
-                || fc0.num_wires() != w_ln
-                || fc1.num_wires() != w_ln + ln_size
-            {
+            let overlapped = std::thread::scope(|scope| -> Result<_, V2Error> {
+                let sb = scope.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let r = crate::acceptance::trace::with_clean_pin_gates(|| section_sb(&mut fs));
+                    (r, t.elapsed().as_secs_f64() * 1e3)
+                });
+                let setup_t = std::time::Instant::now();
+                let mut fa = builder.amun_fork_witness_cached(fork_wa, &builder.amun_cache_snapshot()).map_err(fail)?;
+                let mut fc0 = builder.amun_fork_witness_cached(start2, &snaps.pre).map_err(fail)?;
+                let (roots, prev, selectors) = c_pre(&mut fc0);
+                if fc0.num_wires() != start2 + pre_size {
+                    return Err(fail("pre-arm section size changed"));
+                }
+                let mut fc1 = fc0.amun_fork_witness_cached(w_ln, &snaps.ln).map_err(fail)?;
+                let setup_ms = setup_t.elapsed().as_secs_f64() * 1e3;
+                let ((columns, ms_a), ((small, ms_c1), (large_native, ms_c2))) = rayon::join(
+                    || { let t = std::time::Instant::now(); let r = section_a(&mut fa); (r, t.elapsed().as_secs_f64() * 1e3) },
+                    || {
+                        rayon::join(
+                            || {
+                                crate::acceptance::trace::with_clean_pin_gates(|| {
+                                    { let t = std::time::Instant::now(); let r = c_arms(&mut fc0, &[Class::Small], &roots, &prev, &selectors); (r, t.elapsed().as_secs_f64() * 1e3) }
+                                })
+                            },
+                            || {
+                                crate::acceptance::trace::with_clean_pin_gates(|| {
+                                    { let t = std::time::Instant::now(); let r = c_arms(&mut fc1, &[Class::Large, Class::Native], &roots, &prev, &selectors); (r, t.elapsed().as_secs_f64() * 1e3) }
+                                })
+                            },
+                        )
+                    },
+                );
+                let mut columns = columns?;
+                let mut arms = small?;
+                arms.extend(large_native?);
+                if fa.num_wires() != w_seal || fc0.num_wires() != w_ln || fc1.num_wires() != w_ln + ln_size {
+                    let _ = sb.join();
+                    return Err(fail("a forked section changed size"));
+                }
+                // Finalize reads the parent columns and the arm wires, not the block section.
+                // Build that witness (block range left zero) and run it while S+B is still going.
+                let end = w_ln + ln_size;
+                let mut early = fa.amun_clone_witness().map_err(fail)?;
+                early.amun_pad_witness(end).map_err(fail)?;
+                early.amun_copy_witness_range(&fc0, start2, w_ln).map_err(fail)?;
+                early.amun_copy_witness_range(&fc1, w_ln, end).map_err(fail)?;
+                early.amun_restore_caches(&snaps.end).map_err(fail)?;
+                early.amun_apply_flags(&snaps.flag_changes).map_err(fail)?;
+                early.amun_recount_pending();
+                let flags_before = early.amun_witness_view().1.to_vec();
+                let pending_before = early.amun_pending_counts();
+                let publics_before = early.amun_publics_len();
+                let patches_before = early.amun_patch_lens();
+                let mut obligations = Vec::new();
+                let mut recorded_children = Vec::new();
+                let mut recorded_parents = Vec::new();
+                for (obligation, child, parent) in arms {
+                    obligations.push(obligation);
+                    recorded_children.push(child);
+                    recorded_parents.push(parent);
+                }
+                if runtime.bank.config().shared_m24() {
+                    columns.align_shared_replay_hints(&early, &recorded_children, &recorded_parents)?;
+                }
+                let fin_t = std::time::Instant::now();
+                let fin_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_pin_gate(&gate, || {
+                        let call = if runtime.bank.config().shared_m24() {
+                            crate::acceptance::trace::r_pcs_region::finalize_shared_history_step_parent_region
+                        } else {
+                            finalize_history_step_parent_region
+                        };
+                        call(
+                            &mut early,
+                            columns,
+                            &obligations,
+                            &selectors,
+                            &recorded_children,
+                            &recorded_parents,
+                        )
+                    })
+                }));
+                let finalize_ms = fin_t.elapsed().as_secs_f64() * 1e3;
+                let prepared = match fin_result {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        let _ = sb.join();
+                        return Err(fail("finalize overlap panicked"));
+                    }
+                };
+                let parent_seal_timed = sb.join().map_err(|_| fail("S+B section panicked"))?;
+                Ok((
+                    fa,
+                    fc0,
+                    fc1,
+                    early,
+                    prepared,
+                    flags_before,
+                    pending_before,
+                    publics_before,
+                    patches_before,
+                    prev,
+                    selectors,
+                    setup_ms,
+                    ms_a,
+                    ms_c1,
+                    ms_c2,
+                    finalize_ms,
+                    parent_seal_timed,
+                ))
+            })?;
+            let (
+                fa,
+                fc0,
+                fc1,
+                early,
+                prepared,
+                flags_before,
+                pending_before,
+                publics_before,
+                patches_before,
+                prev,
+                selectors,
+                setup_ms,
+                ms_a,
+                ms_c1,
+                ms_c2,
+                finalize_ms,
+                parent_seal_block_timed,
+            ) = overlapped;
+            let ((parent_seal, block, _), ms_sb) = parent_seal_block_timed;
+            let parallel_ms = amun_t.elapsed().as_secs_f64() * 1e3;
+            let join_t = std::time::Instant::now();
+            if fs.num_wires() != w_block + b_size {
                 return Err(fail("a forked section changed size"));
             }
             builder.amun_join_witness(fa, fork_wa).map_err(fail)?;
@@ -461,7 +583,24 @@ fn prepare_assembly<const TIER: usize>(
             builder.amun_join_witness(fc1, w_ln).map_err(fail)?;
             builder.amun_restore_caches(&snaps.end).map_err(fail)?;
             builder.amun_apply_flags(&snaps.flag_changes).map_err(fail)?;
-            (parent_seal, block, prev, selectors, columns, arms)
+            builder
+                .amun_install_finalize_tail(
+                    &early,
+                    w_seal,
+                    start2,
+                    &flags_before,
+                    pending_before,
+                    publics_before,
+                    patches_before,
+                )
+                .map_err(fail)?;
+            if super::amun_fork::trace() {
+                let join_ms = join_t.elapsed().as_secs_f64() * 1e3;
+                eprintln!(
+                    "amun fork v2.1 trace: parallel part {parallel_ms:.0} ms (setup {setup_ms:.0} beside S+B, A {ms_a:.0}, S+B {ms_sb:.0}, C1 {ms_c1:.0}, C2 {ms_c2:.0}, join {join_ms:.0}, finalize {finalize_ms:.0} beside S+B)"
+                );
+            }
+            (parent_seal, block, prev, selectors, AmunStep::Early(prepared))
         }
         None => {
             let columns = section_a(&mut builder)?;
@@ -502,35 +641,45 @@ fn prepare_assembly<const TIER: usize>(
                 (a_end - fork_wa, seal_end - a_end, b_end - seal_end, p_end - b_end, pre_end - p_end, small_end - pre_end, ln_end - small_end),
                 super::amun_fork::Snaps { sb: snap_sb, p: snap_p, pre: snap_pre, ln: snap_ln, end: snap_end, flag_changes },
             );
-            (parent_seal, block, prev, selectors, columns, arms)
+            (parent_seal, block, prev, selectors, AmunStep::Later(columns, arms))
         }
     };
-    let mut obligations = Vec::new();
-    let mut recorded_children = Vec::new();
-    let mut recorded_parents = Vec::new();
-    for (o, c, p) in arms {
-        obligations.push(o);
-        recorded_children.push(c);
-        recorded_parents.push(p);
-    }
-    if runtime.bank.config().shared_m24() {
-        columns.align_shared_replay_hints(&builder, &recorded_children, &recorded_parents)?;
-    }
-    let finalize = if runtime.bank.config().shared_m24() {
-        crate::acceptance::trace::r_pcs_region::finalize_shared_history_step_parent_region
-    } else {
-        finalize_history_step_parent_region
+    let parent = match step {
+        AmunStep::Early(prepared) => prepared,
+        AmunStep::Later(mut columns, arms) => {
+            let mut obligations = Vec::new();
+            let mut recorded_children = Vec::new();
+            let mut recorded_parents = Vec::new();
+            for (o, c, p) in arms {
+                obligations.push(o);
+                recorded_children.push(c);
+                recorded_parents.push(p);
+            }
+            if runtime.bank.config().shared_m24() {
+                columns.align_shared_replay_hints(&builder, &recorded_children, &recorded_parents)?;
+            }
+            let finalize = if runtime.bank.config().shared_m24() {
+                crate::acceptance::trace::r_pcs_region::finalize_shared_history_step_parent_region
+            } else {
+                finalize_history_step_parent_region
+            };
+            let fin_t = std::time::Instant::now();
+            let parent = with_pin_gate(&gate, || {
+                finalize(
+                    &mut builder,
+                    columns,
+                    &obligations,
+                    &selectors,
+                    &recorded_children,
+                    &recorded_parents,
+                )
+            })?;
+            if super::amun_fork::trace() {
+                eprintln!("amun fork v2.1 trace: finalize {:.0} ms", fin_t.elapsed().as_secs_f64() * 1e3);
+            }
+            parent
+        }
     };
-    let parent = with_pin_gate(&gate, || {
-        finalize(
-            &mut builder,
-            columns,
-            &obligations,
-            &selectors,
-            &recorded_children,
-            &recorded_parents,
-        )
-    })?;
     crate::acceptance::row_ledger_mark(
         &builder,
         &mut row_ledger,
@@ -734,12 +883,16 @@ pub fn prepare_for_pow<const TIER: usize>(
     if current.sealed_header.nonce != 0 {
         return Err(V2Error::Boundary);
     }
+    super::amun_fork::stage("prepare_parent start");
     let prepared = prepare_parent(runtime, class, origin, parent, &current)?;
+    super::amun_fork::stage("prepare_parent done");
     let header = current.sealed_header;
     let parent_header = current.parent_header;
     let start = current.start_accumulator.clone();
+    let amun_assembly = prepare_assembly(runtime, prepared, current, false, false)?;
+    super::amun_fork::stage("assembly done");
     Ok(PreparedForPow {
-        assembly: prepare_assembly(runtime, prepared, current, false, false)?,
+        assembly: amun_assembly,
         header,
         parent_header,
         start,
@@ -755,8 +908,10 @@ impl PreparedForPow {
             .start
             .advance(&self.parent_header, &self.header)
             .map_err(|_| V2Error::Boundary)?;
+        super::amun_fork::stage("seal_nonce start");
         match finish_assembly(runtime, self.assembly, &self.header, &end)? {
-            AssemblyOutput::Built(built) => Ok(built),
+            AssemblyOutput::Built(built) => { super::amun_fork::stage("finish done");
+ Ok(built) }
             _ => unreachable!("witness assembly"),
         }
     }
@@ -770,9 +925,11 @@ pub fn prove_built(
     if cancellation.load(std::sync::atomic::Ordering::Acquire) {
         return Err(V2Error::Cancelled);
     }
+    super::amun_fork::stage("prove_built start");
     let class = built.class;
     let config = runtime.bank.config().class(class);
     runtime.bank.authenticate(class, &built.matrix)?;
+    super::amun_fork::stage("authenticated");
     if runtime.bank.parse(&built.io)?.class != class {
         return Err(V2Error::Io);
     }
@@ -788,6 +945,7 @@ pub fn prove_built(
             let parent = built.preparations.parent.certified_c1_prover_plan()?;
             let block = built.preparations.block.certified_c1_prover_plan()?;
             let mut channel = FsLaneChallenger::new_c1(PROOF_DOMAIN);
+            super::amun_fork::stage("plans ready");
             $function(
                 $matrix,
                 &built.witness,

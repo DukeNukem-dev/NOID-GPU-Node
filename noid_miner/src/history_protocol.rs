@@ -164,6 +164,26 @@ impl HistoryProtocolRuntime {
         self.finance.is_some() && params::v2_1_active(height)
     }
 
+    /// Ghost arms for this parent terminal. A different in-flight terminal is replaced.
+    pub fn prefetch_v21_ghosts(&self, terminal_bytes: &[u8]) -> Result<(), String> {
+        self.prefetch_v21_ghosts_with(terminal_bytes, true)
+    }
+
+    /// Same as `prefetch_v21_ghosts`, but a prefetch already stored for another
+    /// terminal is left alone. Used to refill the parent that a proof just consumed.
+    pub fn prefetch_v21_ghosts_keeping_other(&self, terminal_bytes: &[u8]) -> Result<(), String> {
+        self.prefetch_v21_ghosts_with(terminal_bytes, false)
+    }
+
+    fn prefetch_v21_ghosts_with(&self, terminal_bytes: &[u8], replace: bool) -> Result<(), String> {
+        let Some(runtime) = self.finance.clone() else {
+            return Err("scheduled native runtime unavailable".into());
+        };
+        runtime
+            .prefetch_ghosts_from_terminal(terminal_bytes, replace)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn finance_at(&self, height: u64) -> Result<&v21::Runtime, String> {
         if !params::v2_1_active(height) {
             return Err("native runtime requested before activation".into());

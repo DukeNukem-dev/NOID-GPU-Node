@@ -1459,6 +1459,20 @@ impl RpcHandler {
             (snapshot, addr)
         };
         drop(wallet_operation);
+        let parent_terminal_bytes = if noid_chain::consensus::params::v2_1_active(
+            snapshot.parent.height.saturating_add(1),
+        ) {
+            snapshot.parent_history_step_terminal_bytes.clone()
+        } else {
+            None
+        };
+        if let Some(bytes) = parent_terminal_bytes.as_deref() {
+            if let Some(protocol) = self.history_step_runtime.as_ref() {
+                if let Err(error) = protocol.prefetch_v21_ghosts(bytes) {
+                    tracing::warn!(%error, "v2.1 ghost prefetch skipped");
+                }
+            }
+        }
         let amun_t_build = Instant::now();
         let max_effective_pages = self
             .external_mining_capacity
@@ -1570,6 +1584,15 @@ impl RpcHandler {
         self.require_mining_network()?;
 
         let proof_class = prepared.proof_class();
+        if let noid_miner::MiningProofClass::V21(_) = proof_class {
+            if let Some(bytes) = parent_terminal_bytes.as_deref() {
+                if let Some(protocol) = self.history_step_runtime.as_ref() {
+                    if let Err(error) = protocol.prefetch_v21_ghosts_keeping_other(bytes) {
+                        tracing::warn!(%error, "v2.1 ghost prefetch skipped");
+                    }
+                }
+            }
+        }
         let user_pages = prepared.user_page_count();
         let (previous_page_limit, next_page_limit, b25_prepare_ms_ewma, b255_prepare_ms_ewma) = {
             let mut capacity = self
@@ -1712,6 +1735,15 @@ impl RpcHandler {
 
         validate_pow(&prepared.pow_header(nonce))
             .map_err(|error| rpc_err(format!("proof of work: {error}")))?;
+
+        if let noid_miner::MiningProofClass::V21(_) = prepared.proof_class() {
+            if let Some(protocol) = self.history_step_runtime.as_ref() {
+                let terminal_bytes = prepared.shadow_verify_inputs().0;
+                if let Err(error) = protocol.prefetch_v21_ghosts(&terminal_bytes) {
+                    tracing::warn!(%error, "v2.1 ghost prefetch skipped");
+                }
+            }
+        }
 
         let seal_started = Instant::now();
         let runtime = self

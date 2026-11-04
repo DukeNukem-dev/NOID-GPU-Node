@@ -103,6 +103,10 @@ pub struct Runtime {
     parts: RuntimeParts,
     matrices: Box<dyn MatrixSource>,
     cache: decision::ClaimCache,
+    /// Last parent-proof replay. Admission and later templates share this runtime.
+    replay_cache: std::sync::Mutex<Option<parent::ReplaySlot>>,
+    /// Ghost arms for the next prepare, filled after this block's proof.
+    ghost_prefetch: std::sync::Mutex<Option<parent::GhostInflight>>,
 }
 impl Runtime {
     pub fn new(
@@ -116,10 +120,29 @@ impl Runtime {
             parts,
             matrices,
             cache: Default::default(),
+            replay_cache: std::sync::Mutex::new(None),
+            ghost_prefetch: std::sync::Mutex::new(None),
         })
     }
     pub fn bank(&self) -> &Bank {
         &self.bank
+    }
+
+    /// Start ghost arms for the parent terminal in `bytes`.
+    /// `replace` false leaves a prefetch for a different terminal in place.
+    pub fn prefetch_ghosts_from_terminal(
+        self: &std::sync::Arc<Self>,
+        bytes: &[u8],
+        replace: bool,
+    ) -> Result<(), V2Error> {
+        let terminal = decode_terminal(self, bytes)?;
+        parent::start_ghost_prefetch(
+            std::sync::Arc::clone(self),
+            terminal.class,
+            terminal.proof.io,
+            replace,
+        );
+        Ok(())
     }
     pub fn parts(&self) -> &RuntimeParts {
         &self.parts

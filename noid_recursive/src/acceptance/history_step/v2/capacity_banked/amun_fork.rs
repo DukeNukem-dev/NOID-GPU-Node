@@ -65,3 +65,10 @@ pub(super) fn fail(reason: &str) -> V2Error {
     eprintln!("amun fork v2.1: {reason}; forking disabled, sequential assembly from now on");
     V2Error::Layout
 }
+
+/// amun: stage marker for the proof timeline (journal timestamps give the gaps).
+pub(super) fn stage(label: &str) {
+    if trace() {
+        eprintln!("amun stage: {label}");
+    }
+}

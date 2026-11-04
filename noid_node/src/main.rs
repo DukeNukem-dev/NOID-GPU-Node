@@ -4353,6 +4353,10 @@ async fn apply_exact_suffix_offthread(
                 ExactSuffixApplyError::Other(error)
             }
         })?;
+        // The next template extends this tip. Start its ghost arms before commit.
+        if let Err(error) = runtime.prefetch_v21_ghosts(&fetched.terminal_bytes) {
+            tracing::warn!(%error, "v2.1 ghost prefetch skipped");
+        }
     }
     let _wallet_operation = wallet_operation_gate.lock().await;
     let (reserved_input_slots, reserved_output_slots) = mempool.reserved_slots().await;

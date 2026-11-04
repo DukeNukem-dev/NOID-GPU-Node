@@ -76,6 +76,69 @@ pub fn encode_terminal(runtime: &Runtime, terminal: &Terminal) -> Result<Vec<u8>
     Ok(out)
 }
 
+/// Bytes `replay` reads, uncompressed. A cache key, not a proof identity.
+pub(super) fn terminal_replay_key(
+    runtime: &Runtime,
+    terminal: &Terminal,
+) -> Result<[u8; 32], V2Error> {
+    let class = terminal.class;
+    let config = runtime.bank.config().class(class);
+    let mut out = Vec::new();
+    out.extend_from_slice(&terminal.proof.commitment.root);
+    encode_f128_vec(&mut out, &terminal.proof.io, IO_LEN).map_err(|_| V2Error::Io)?;
+    encode_field_proof(
+        &mut out,
+        &terminal.proof.field,
+        config.shape(),
+        &config.pcs_params(),
+        true,
+    )
+    .map_err(|_| V2Error::Io)?;
+    out.extend_from_slice(&encode_joint_c1_region_sidecar_canonical(
+        &runtime.parts.parent_vk,
+        runtime.parts.block_vk(class),
+        config.outer_m(),
+        &terminal.proof.sidecar,
+    )?);
+    Ok(mix256(&out))
+}
+
+fn mix256(bytes: &[u8]) -> [u8; 32] {
+    let mut state = [
+        0x243f6a8885a308d3u64,
+        0x13198a2e03707344u64,
+        0xa4093822299f31d0u64,
+        0x082efa98ec4e6c89u64,
+    ];
+    let mut chunks = bytes.chunks_exact(32);
+    for chunk in chunks.by_ref() {
+        for lane in 0..4 {
+            let word = u64::from_le_bytes(chunk[lane * 8..lane * 8 + 8].try_into().unwrap());
+            state[lane] = state[lane]
+                .wrapping_mul(0x9e3779b185ebca87)
+                .wrapping_add(word)
+                ^ word.rotate_left(17);
+            state[lane] = state[lane].rotate_left(27).wrapping_mul(0xbf58476d1ce4e5b9);
+        }
+    }
+    for (index, byte) in chunks.remainder().iter().enumerate() {
+        let lane = index & 3;
+        state[lane] = state[lane]
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(*byte as u64);
+    }
+    state[0] ^= bytes.len() as u64;
+    for lane in 0..4 {
+        state[lane] ^= state[(lane + 1) & 3].rotate_left(17);
+        state[lane] = state[lane].wrapping_mul(0x94d049bb133111eb);
+    }
+    let mut out = [0u8; 32];
+    for (lane, word) in state.iter().enumerate() {
+        out[lane * 8..lane * 8 + 8].copy_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
 /// Bounded decode is not acceptance. The caller must invoke `verify_terminal`
 /// with an authenticated origin and the selected sealed header.
 pub fn decode_terminal(runtime: &Runtime, bytes: &[u8]) -> Result<Terminal, V2Error> {

@@ -1027,6 +1027,15 @@ impl FieldR1csBuilder {
             if pf == ff && fork.values[i] == self.values[i] {
                 continue;
             }
+            // The pin section runs on the parent after the arm forks are taken and
+            // can consume an eligible linear row. The fork still has that bit.
+            // The value is unchanged, so the parent's flags stand.
+            if fork.values[i] == self.values[i]
+                && pf | ELIGIBLE_LINEAR_ROW == ff
+                && pf & ELIGIBLE_LINEAR_ROW == 0
+            {
+                continue;
+            }
             let clears_only = ff & !pf == 0 && ff != pf;
             let value_ok = fork.values[i] == self.values[i] || pf & PENDING_WITNESS_VALUE != 0;
             if !clears_only || !value_ok {
@@ -1070,6 +1079,170 @@ impl FieldR1csBuilder {
             self.tower_bit_wires.entry(key).or_insert(bits);
         }
         self.tower_bit_nested_bytes = self.tower_bit_nested_bytes.max(fork.tower_bit_nested_bytes);
+        Ok(())
+    }
+
+    /// amun: duplicate a witness-only builder so finalize can run beside another fork.
+    /// The product observer is off on every forked assembly.
+    pub fn amun_clone_witness(&self) -> Result<Self, &'static str> {
+        if self.product_observer.is_some() {
+            return Err("finalize clone needs the product observer off");
+        }
+        Ok(Self {
+            values: self.values.clone(),
+            a_cols: self.a_cols.clone(),
+            a_value_indices: self.a_value_indices.clone(),
+            a_offsets: self.a_offsets.clone(),
+            b_cols: self.b_cols.clone(),
+            b_value_indices: self.b_value_indices.clone(),
+            b_offsets: self.b_offsets.clone(),
+            value_table: self.value_table.clone(),
+            value_map: self.value_map.clone(),
+            publics: self.publics.clone(),
+            record_rows: self.record_rows,
+            builder_brand: self.builder_brand,
+            deferred_witness_slots: self.deferred_witness_slots.clone(),
+            pending_deferred_witness_slots: self.pending_deferred_witness_slots,
+            pending_deferred_constraint_slots: self.pending_deferred_constraint_slots,
+            deferred_constraint_patches: self.deferred_constraint_patches.clone(),
+            deferred_patch_a_cols: self.deferred_patch_a_cols.clone(),
+            deferred_patch_a_value_indices: self.deferred_patch_a_value_indices.clone(),
+            deferred_patch_b_cols: self.deferred_patch_b_cols.clone(),
+            deferred_patch_b_value_indices: self.deferred_patch_b_value_indices.clone(),
+            tower_bit_wires: self.tower_bit_wires.clone(),
+            tower_bit_nested_bytes: self.tower_bit_nested_bytes,
+            product_observer: None,
+            fused_boolean_pins: self.fused_boolean_pins,
+            reuse_linear_rows: self.reuse_linear_rows,
+            reused_linear_pins: self.reused_linear_pins,
+            symbolic_product_aliases: self.symbolic_product_aliases,
+            constant_product_wires: self.constant_product_wires.clone(),
+            product_alias_stats: self.product_alias_stats,
+            checked_boolean_gates: self.checked_boolean_gates.clone(),
+            checked_boolean_gate_bytes: self.checked_boolean_gate_bytes,
+            boolean_pin_stats: self.boolean_pin_stats,
+            amun_fork_base: self.amun_fork_base,
+            amun_fork_pending0: self.amun_fork_pending0,
+            amun_fork_constraint0: self.amun_fork_constraint0,
+        })
+    }
+
+    /// amun: extend the witness with zero values and clear flags. Wire indices stay put.
+    pub fn amun_pad_witness(&mut self, len: usize) -> Result<(), &'static str> {
+        if len < self.values.len() {
+            return Err("finalize pad shortens the witness");
+        }
+        self.values.resize(len, F128::ZERO);
+        self.deferred_witness_slots.resize(len, 0);
+        Ok(())
+    }
+
+    /// amun: copy one witness range (values and deferred-slot flags) from `src`.
+    pub fn amun_copy_witness_range(&mut self, src: &Self, from: usize, to: usize) -> Result<(), &'static str> {
+        if to < from || to > self.values.len() || to > src.values.len() || to > src.deferred_witness_slots.len() {
+            return Err("finalize witness range");
+        }
+        self.values[from..to].copy_from_slice(&src.values[from..to]);
+        self.deferred_witness_slots[from..to].copy_from_slice(&src.deferred_witness_slots[from..to]);
+        Ok(())
+    }
+
+    /// amun: pending counters from the flag bytes, after a range copy that did not update them.
+    pub fn amun_recount_pending(&mut self) {
+        self.pending_deferred_witness_slots = self
+            .deferred_witness_slots
+            .iter()
+            .filter(|flags| *flags & PENDING_WITNESS_VALUE != 0)
+            .count();
+        self.pending_deferred_constraint_slots = self
+            .deferred_witness_slots
+            .iter()
+            .filter(|flags| *flags & PENDING_CONSTRAINT_ROW != 0)
+            .count();
+    }
+
+    pub fn amun_pending_counts(&self) -> (usize, usize) {
+        (self.pending_deferred_witness_slots, self.pending_deferred_constraint_slots)
+    }
+
+    pub fn amun_publics_len(&self) -> usize {
+        self.publics.len()
+    }
+
+    pub fn amun_patch_lens(&self) -> (usize, usize, usize) {
+        (
+            self.deferred_constraint_patches.len(),
+            self.deferred_patch_a_cols.len(),
+            self.deferred_patch_b_cols.len(),
+        )
+    }
+
+    /// amun: append finalize's new wires, and its flag and cache updates outside `gap_lo..gap_hi`.
+    /// The gap is the block section, whose real witness stays on `self`. Finalize must not have
+    /// changed flags there, and the other wires must already match.
+    pub fn amun_install_finalize_tail(
+        &mut self,
+        early: &Self,
+        gap_lo: usize,
+        gap_hi: usize,
+        flags_before: &[u8],
+        pending_before: (usize, usize),
+        publics_before: usize,
+        patches_before: (usize, usize, usize),
+    ) -> Result<(), &'static str> {
+        let end = self.values.len();
+        if self.deferred_witness_slots.len() != end
+            || flags_before.len() != end
+            || early.values.len() < end
+            || early.deferred_witness_slots.len() != early.values.len()
+            || gap_lo > gap_hi
+            || gap_hi > end
+            || early.record_rows != self.record_rows
+            || early.builder_brand != self.builder_brand
+        {
+            return Err("finalize tail: length");
+        }
+        if early.values[..gap_lo] != self.values[..gap_lo] || early.values[gap_hi..end] != self.values[gap_hi..end] {
+            eprintln!("amun fork v2.1: finalize overlap witness mismatch (gap {gap_lo}..{gap_hi}, end {end})");
+            return Err("finalize tail: witness mismatch");
+        }
+        if early.deferred_witness_slots[gap_lo..gap_hi] != flags_before[gap_lo..gap_hi] {
+            let n = early.deferred_witness_slots[gap_lo..gap_hi]
+                .iter()
+                .zip(&flags_before[gap_lo..gap_hi])
+                .filter(|(after, before)| after != before)
+                .count();
+            eprintln!("amun fork v2.1: finalize overlap changed {n} flags inside the block gap");
+            return Err("finalize tail: gap flags changed");
+        }
+        if early.amun_patch_lens() != patches_before {
+            return Err("finalize tail: constraint patches changed");
+        }
+        if early.publics.len() < publics_before {
+            return Err("finalize tail: publics shrank");
+        }
+        self.deferred_witness_slots[..gap_lo].copy_from_slice(&early.deferred_witness_slots[..gap_lo]);
+        self.deferred_witness_slots[gap_hi..end].copy_from_slice(&early.deferred_witness_slots[gap_hi..end]);
+        self.values.extend_from_slice(&early.values[end..]);
+        self.deferred_witness_slots.extend_from_slice(&early.deferred_witness_slots[end..]);
+        fn add_pending(base: usize, after: usize, before: usize) -> Result<usize, &'static str> {
+            if after >= before {
+                base.checked_add(after - before).ok_or("finalize tail: pending overflow")
+            } else {
+                base.checked_sub(before - after).ok_or("finalize tail: pending underflow")
+            }
+        }
+        let (witness_after, constraint_after) = early.amun_pending_counts();
+        self.pending_deferred_witness_slots = add_pending(self.pending_deferred_witness_slots, witness_after, pending_before.0)?;
+        self.pending_deferred_constraint_slots =
+            add_pending(self.pending_deferred_constraint_slots, constraint_after, pending_before.1)?;
+        self.publics.extend_from_slice(&early.publics[publics_before..]);
+        let snap = early.amun_cache_snapshot();
+        self.amun_restore_caches(&snap)?;
+        for (key, bits) in &early.tower_bit_wires {
+            self.tower_bit_wires.entry(key.clone()).or_insert_with(|| bits.clone());
+        }
+        self.tower_bit_nested_bytes = self.tower_bit_nested_bytes.max(early.tower_bit_nested_bytes);
         Ok(())
     }
 
