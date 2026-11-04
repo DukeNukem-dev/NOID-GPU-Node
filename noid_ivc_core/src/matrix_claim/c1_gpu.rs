@@ -2,8 +2,9 @@
 //!
 //! Same transcript, same proof: every table, round coefficient and final value is computed exactly as on
 //! the CPU (GF(2^256) arithmetic is exact and additions are XORs, so evaluation order cannot change a
-//! value). Only the compact (frozen protocol) matrices are offloaded; their CSR and stacked CSC are
-//! decoded once and kept on the GPU, keyed by the statement digest.
+//! value). Only the compact (frozen protocol) matrices are offloaded. They are decoded once and the
+//! host tables are kept, keyed by the statement digest. CSR and the stacked CSC are uploaded one at
+//! a time: a 2^24 matrix plus the phase-1 scratch does not fit on an 8 GB card together.
 //!
 //! All GPU work that does not depend on the transcript (equality tables, row images, phase-1 weights)
 //! runs before the transcript is touched, so any setup failure falls back to the CPU path. A failure
@@ -36,10 +37,25 @@ fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("NOID_GPU_FOLD").is_ok_and(|v| v == "0"))
 }
 
-/// The frozen matrix on the GPU: CSR per side (A, B) and the stacked CSC, sharing one coefficient dictionary.
+struct HostCsr {
+    rp: [Vec<u64>; 2],
+    col: [Vec<u32>; 2],
+    ci: [Vec<u32>; 2],
+}
+
+struct HostCsc {
+    cp: Vec<u64>,
+    srow: Vec<u32>,
+    ci: Vec<u32>,
+}
+
+/// Host tables live for the process. Device CSR and CSC are uploaded only while a stage needs them.
 struct Matrix {
     key: ([u8; 32], usize),
     width: usize,
+    dict_host: Vec<F128>,
+    csr_host: HostCsr,
+    csc_host: HostCsc,
     dict: DBuf,
     rp: [DBuf; 2],
     col: [DBuf; 2],
@@ -124,8 +140,9 @@ fn grid(n: u64) -> u64 {
     n.div_ceil(BLOCK as u64).min(1 << 16)
 }
 
-/// Decode the compact matrix into CSR (per side) and stacked CSC, upload, free the host copies.
-fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matrix, String> {
+/// Decode once into host CSR and stacked CSC. Device copies are uploaded later, and only one
+/// of them is resident during the phase-1 scratch.
+fn build_host_matrix(r1cs: &CompactFieldR1cs, width: usize) -> Result<Matrix, String> {
     let t0 = Instant::now();
     let mut dict: Vec<F128> = Vec::new();
     let mut dict_index: HashMap<(u64, u64), u32> = HashMap::new();
@@ -150,22 +167,12 @@ fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matri
             }
         }
     }
-    let mut m = Matrix {
-        key: (r1cs.amun_statement_digest(), width),
-        width,
-        dict: DBuf::default(),
-        rp: Default::default(),
-        col: Default::default(),
-        ci: Default::default(),
-        cp: DBuf::default(),
-        ecol: DBuf::default(),
-        srow: DBuf::default(),
-        csc_ci: DBuf::default(),
-        nnz: triples[0].len() + triples[1].len(),
+    let nnz = triples[0].len() + triples[1].len();
+    let mut csr = HostCsr {
+        rp: [Vec::new(), Vec::new()],
+        col: [Vec::new(), Vec::new()],
+        ci: [Vec::new(), Vec::new()],
     };
-    let d = g.ensure(&mut m.dict, dict.len() * 16)?;
-    g.htod(d, &dict)?;
-    // CSR per side (counting sort by row; the order within a row does not matter for an XOR sum).
     for s in 0..2 {
         let t = &triples[s];
         let mut rp = vec![0u64; width + 1];
@@ -184,14 +191,10 @@ fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matri
             ci[at] = k;
             fill[r as usize] += 1;
         }
-        let p = g.ensure(&mut m.rp[s], rp.len() * 8)?;
-        g.htod(p, &rp)?;
-        let p = g.ensure(&mut m.col[s], col.len() * 4)?;
-        g.htod(p, &col)?;
-        let p = g.ensure(&mut m.ci[s], ci.len() * 4)?;
-        g.htod(p, &ci)?;
+        csr.rp[s] = rp;
+        csr.col[s] = col;
+        csr.ci[s] = ci;
     }
-    // Stacked CSC: rows of B are offset by `width`.
     let mut cp = vec![0u64; width + 1];
     for t in &triples {
         for &(_, c, _) in t {
@@ -202,8 +205,8 @@ fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matri
         cp[i + 1] += cp[i];
     }
     let mut fill = cp.clone();
-    let mut srow = vec![0u32; m.nnz];
-    let mut ci = vec![0u32; m.nnz];
+    let mut srow = vec![0u32; nnz];
+    let mut ci = vec![0u32; nnz];
     for (s, t) in triples.iter().enumerate() {
         for &(r, c, k) in t {
             let at = fill[c as usize] as usize;
@@ -212,30 +215,142 @@ fn upload_matrix(g: &Gpu, r1cs: &CompactFieldR1cs, width: usize) -> Result<Matri
             fill[c as usize] += 1;
         }
     }
-    let p = g.ensure(&mut m.cp, cp.len() * 8)?;
-    g.htod(p, &cp)?;
-    let mut ecol = vec![0u32; m.nnz];
-    let mut longest = 0u64;
-    for c in 0..width {
-        ecol[cp[c] as usize..cp[c + 1] as usize].fill(c as u32);
-        longest = longest.max(cp[c + 1] - cp[c]);
-    }
-    let p = g.ensure(&mut m.ecol, ecol.len() * 4)?;
-    g.htod(p, &ecol)?;
-    eprintln!("amun gpu fold: longest column {longest} entries");
-    let p = g.ensure(&mut m.srow, srow.len() * 4)?;
-    g.htod(p, &srow)?;
-    let p = g.ensure(&mut m.csc_ci, ci.len() * 4)?;
-    g.htod(p, &ci)?;
-    g.sync()?;
     eprintln!(
-        "amun gpu fold: matrix uploaded (width 2^{}, nnz {}, {} distinct coefficients, {:.0} ms)",
+        "amun gpu matrix: decoded width 2^{} nnz {} coefficients {} in {:.0} ms",
         width.trailing_zeros(),
-        m.nnz,
+        nnz,
         dict.len(),
         t0.elapsed().as_secs_f64() * 1e3
     );
-    Ok(m)
+    Ok(Matrix {
+        key: (r1cs.amun_statement_digest(), width),
+        width,
+        dict_host: dict,
+        csr_host: csr,
+        csc_host: HostCsc { cp, srow, ci },
+        dict: DBuf::default(),
+        rp: Default::default(),
+        col: Default::default(),
+        ci: Default::default(),
+        cp: DBuf::default(),
+        ecol: DBuf::default(),
+        srow: DBuf::default(),
+        csc_ci: DBuf::default(),
+        nnz,
+    })
+}
+
+fn release_device(g: &Gpu, m: &mut Matrix) {
+    g.free(&mut m.dict);
+    for s in 0..2 {
+        g.free(&mut m.rp[s]);
+        g.free(&mut m.col[s]);
+        g.free(&mut m.ci[s]);
+    }
+    g.free(&mut m.cp);
+    g.free(&mut m.ecol);
+    g.free(&mut m.srow);
+    g.free(&mut m.csc_ci);
+}
+
+/// Drop device memory and keep the host tables. Used from idle trim, where the context is current.
+fn release_device_drop(m: &mut Matrix) {
+    m.dict = DBuf::default();
+    m.rp = Default::default();
+    m.col = Default::default();
+    m.ci = Default::default();
+    m.cp = DBuf::default();
+    m.ecol = DBuf::default();
+    m.srow = DBuf::default();
+    m.csc_ci = DBuf::default();
+}
+
+fn park_other_widths(g: &Gpu, st: &mut State, width: usize) {
+    for m in &mut st.matrices {
+        if m.width != width {
+            release_device(g, m);
+        }
+    }
+}
+
+fn ensure_dict(g: &Gpu, m: &mut Matrix) -> Result<(), String> {
+    if m.dict.ptr != 0 {
+        return Ok(());
+    }
+    let p = g.ensure(&mut m.dict, m.dict_host.len() * 16)?;
+    g.htod(p, &m.dict_host)
+}
+
+fn free_csr(g: &Gpu, m: &mut Matrix) {
+    for s in 0..2 {
+        g.free(&mut m.rp[s]);
+        g.free(&mut m.col[s]);
+        g.free(&mut m.ci[s]);
+    }
+}
+
+fn free_csc(g: &Gpu, m: &mut Matrix) {
+    g.free(&mut m.cp);
+    g.free(&mut m.ecol);
+    g.free(&mut m.srow);
+    g.free(&mut m.csc_ci);
+}
+
+fn ensure_csr(g: &Gpu, m: &mut Matrix) -> Result<(), String> {
+    if m.rp[0].ptr != 0 {
+        return Ok(());
+    }
+    let t0 = Instant::now();
+    ensure_dict(g, m)?;
+    for s in 0..2 {
+        let p = g.ensure(&mut m.rp[s], m.csr_host.rp[s].len() * 8)?;
+        g.htod(p, &m.csr_host.rp[s])?;
+        let p = g.ensure(&mut m.col[s], m.csr_host.col[s].len() * 4)?;
+        g.htod(p, &m.csr_host.col[s])?;
+        let p = g.ensure(&mut m.ci[s], m.csr_host.ci[s].len() * 4)?;
+        g.htod(p, &m.csr_host.ci[s])?;
+    }
+    g.sync()?;
+    eprintln!(
+        "amun gpu matrix: csr resident (width 2^{}, {:.0} ms)",
+        m.width.trailing_zeros(),
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(())
+}
+
+fn ensure_csc(g: &Gpu, m: &mut Matrix) -> Result<(), String> {
+    if m.ecol.ptr != 0 {
+        return Ok(());
+    }
+    let t0 = Instant::now();
+    ensure_dict(g, m)?;
+    let mut ecol = vec![0u32; m.nnz];
+    let mut longest = 0u64;
+    for c in 0..m.width {
+        let start = m.csc_host.cp[c] as usize;
+        let end = m.csc_host.cp[c + 1] as usize;
+        ecol[start..end].fill(c as u32);
+        longest = longest.max((end - start) as u64);
+    }
+    let cp_bytes = m.csc_host.cp.len() * 8;
+    let p = g.ensure(&mut m.cp, cp_bytes)?;
+    g.htod(p, &m.csc_host.cp)?;
+    let p = g.ensure(&mut m.ecol, ecol.len() * 4)?;
+    g.htod(p, &ecol)?;
+    eprintln!("amun gpu fold: longest column {longest} entries");
+    let p = g.ensure(&mut m.srow, m.csc_host.srow.len() * 4)?;
+    g.htod(p, &m.csc_host.srow)?;
+    let p = g.ensure(&mut m.csc_ci, m.csc_host.ci.len() * 4)?;
+    g.htod(p, &m.csc_host.ci)?;
+    g.sync()?;
+    eprintln!(
+        "amun gpu matrix: csc resident (width 2^{}, nnz {}, {:.0} ms)",
+        m.width.trailing_zeros(),
+        m.nnz,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(())
 }
 
 /// eq table of `point` into `buf` (2^len entries), same step order as `build_eq_table`.
@@ -275,7 +390,8 @@ fn read_one(g: &Gpu, p: DevPtr, index: usize) -> Result<F256, String> {
     Ok(v[0])
 }
 
-/// Everything before the transcript: tables, row images, phase-1 weights (incoming base unscaled).
+/// Row images and phase-1 weights. The column matrix stays off the device until phase 1 ends,
+/// and the row-image vectors are freed before the phase-1 scratch is fully allocated.
 fn prepare(
     g: &mut Gpu,
     st: &mut State,
@@ -288,34 +404,45 @@ fn prepare(
 ) -> Result<(), String> {
     let width = 1usize << k_log;
     st.cur = matrix_slot(g, st, r1cs, width)?;
-    let m = &st.matrices[st.cur];
-    let w = &mut st.work;
+    park_other_widths(g, st, width);
+    let idx = st.cur;
+    free_csc(g, &mut st.matrices[idx]);
+    ensure_csr(g, &mut st.matrices[idx])?;
     let rest_len = width >> k_skip;
     let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
 
-    let rest = g.ensure(&mut w.rest, rest_len * F)?;
-    eq_table(g, k, rest, &fresh.r_inner_rest)?;
-    let zp = g.ensure(&mut w.zp, fresh.z_partial.len() * F)?;
-    g.htod(zp, &fresh.z_partial)?;
-    let v = g.ensure(&mut w.v, width * F)?;
-    outer(g, k, v, zp, k_skip, rest, width)?;
-    let e = g.ensure(&mut w.e, width * F)?;
-    eq_table(g, k, e, incoming_column)?;
-
-    let gv = g.ensure(&mut w.gv[0], 2 * width * F)?;
-    let ge = g.ensure(&mut w.ge[0], 2 * width * F)?;
-    for s in 0..2 {
-        let (mut rp, mut col, mut ci, mut dict) = (m.rp[s].ptr, m.col[s].ptr, m.ci[s].ptr, m.dict.ptr);
-        let (mut nrows, mut vv, mut ee) = (width as u64, v, e);
-        let (mut gvs, mut ges) = (gv + (s * width * F) as u64, ge + (s * width * F) as u64);
-        g.launch(
-            k.spmv_rows,
-            grid(width as u64),
-            BLOCK,
-            &mut [arg!(rp), arg!(col), arg!(ci), arg!(dict), arg!(nrows), arg!(vv), arg!(ee), arg!(gvs), arg!(ges)],
-        )?;
+    {
+        let w = &mut st.work;
+        let rest = g.ensure(&mut w.rest, rest_len * F)?;
+        eq_table(g, k, rest, &fresh.r_inner_rest)?;
+        let zp = g.ensure(&mut w.zp, fresh.z_partial.len() * F)?;
+        g.htod(zp, &fresh.z_partial)?;
+        let v = g.ensure(&mut w.v, width * F)?;
+        outer(g, k, v, zp, k_skip, rest, width)?;
+        let e = g.ensure(&mut w.e, width * F)?;
+        eq_table(g, k, e, incoming_column)?;
+        let gv = g.ensure(&mut w.gv[0], 2 * width * F)?;
+        let ge = g.ensure(&mut w.ge[0], 2 * width * F)?;
+        for s in 0..2 {
+            let m = &st.matrices[idx];
+            let (mut rp, mut col, mut ci, mut dict) = (m.rp[s].ptr, m.col[s].ptr, m.ci[s].ptr, m.dict.ptr);
+            let (mut nrows, mut vv, mut ee) = (width as u64, v, e);
+            let (mut gvs, mut ges) = (gv + (s * width * F) as u64, ge + (s * width * F) as u64);
+            g.launch(
+                k.spmv_rows,
+                grid(width as u64),
+                BLOCK,
+                &mut [arg!(rp), arg!(col), arg!(ci), arg!(dict), arg!(nrows), arg!(vv), arg!(ee), arg!(gvs), arg!(ges)],
+            )?;
+        }
+        g.free(&mut w.rest);
+        g.free(&mut w.zp);
+        g.free(&mut w.v);
+        g.free(&mut w.e);
     }
+    free_csr(g, &mut st.matrices[idx]);
 
+    let w = &mut st.work;
     let lambda = lagrange_weights(k_skip, fresh.z_skip, 0);
     let lp = g.ensure(&mut w.lambda, lambda.len() * F)?;
     g.htod(lp, &lambda)?;
@@ -325,16 +452,13 @@ fn prepare(
     outer(g, k, u, lp, k_skip, inner, width)?;
     let inc = g.ensure(&mut w.inc[0], width * F)?;
     eq_table(g, k, inc, &incoming_row[..k_log])?;
-    // Ping-pong partners for the folds, and the column image.
+    g.free(&mut w.lambda);
+    g.free(&mut w.inner);
     g.ensure(&mut w.gv[1], width * F)?;
     g.ensure(&mut w.ge[1], width * F)?;
     g.ensure(&mut w.u[1], width / 2 * F)?;
     g.ensure(&mut w.inc[1], width / 2 * F)?;
-    g.ensure(&mut w.h[0], width * F)?;
-    g.ensure(&mut w.h[1], width / 2 * F)?;
-    g.ensure(&mut w.v2, width / 2 * F)?;
     g.ensure(&mut w.partials, 2 * REDUCE_GRID as usize * F)?;
-    let _ = m.nnz;
     g.sync()
 }
 
@@ -347,13 +471,13 @@ fn transcript<Ch: Challenger>(
     st: &mut State,
     k: &Kernels,
     k_log: usize,
+    k_skip: usize,
     fresh: &C1FreshLincheckClaim,
     incoming: &C1MatrixAccClaim,
     gate: bool,
     channel: &mut Ch,
 ) -> Result<Output, String> {
     let width = 1usize << k_log;
-    let m = &st.matrices[st.cur];
     let w = &mut st.work;
     let partials = w.partials.ptr;
 
@@ -424,6 +548,30 @@ fn transcript<Ch: Challenger>(
     channel.observe_f256(g_e);
     let delta = channel.sample_f256();
 
+    // Phase 1 no longer needs its scratch. Free it before the column matrix comes back.
+    for buf in &mut w.u {
+        g.free(buf);
+    }
+    for buf in &mut w.inc {
+        g.free(buf);
+    }
+    for buf in &mut w.gv {
+        g.free(buf);
+    }
+    for buf in &mut w.ge {
+        g.free(buf);
+    }
+    for matrix in &mut st.matrices {
+        if matrix.width != width {
+            release_device(g, matrix);
+        }
+    }
+    g.evict_others();
+    ensure_csc(g, &mut st.matrices[st.cur])?;
+    g.ensure(&mut w.h[0], width * F)?;
+    g.ensure(&mut w.h[1], width / 2 * F)?;
+    let m = &st.matrices[st.cur];
+
     // Column image with the factored equality table of rho.
     let low_bits = rho.len() / 2;
     let eqlo = build_eq_table(&rho[..low_bits]);
@@ -453,6 +601,20 @@ fn transcript<Ch: Challenger>(
     let t_p2 = Instant::now();
 
     // Phase 2 (mix, then run_phase_one_product); weights = v_table, mixed in place.
+    // v and e were freed after the row images. Rebuild them now that phase 1's scratch is gone.
+    let rest_len = width >> k_skip;
+    let rest = g.ensure(&mut w.rest, rest_len * F)?;
+    eq_table(g, k, rest, &fresh.r_inner_rest)?;
+    let zp = g.ensure(&mut w.zp, fresh.z_partial.len() * F)?;
+    g.htod(zp, &fresh.z_partial)?;
+    g.ensure(&mut w.v, width * F)?;
+    outer(g, k, w.v.ptr, zp, k_skip, rest, width)?;
+    g.free(&mut w.rest);
+    g.free(&mut w.zp);
+    let (_, incoming_column) = incoming.point.split_at(k_log + 1);
+    let e = g.ensure(&mut w.e, width * F)?;
+    eq_table(g, k, e, incoming_column)?;
+    g.ensure(&mut w.v2, width / 2 * F)?;
     let delta_gate = delta * gate;
     let (mut wts, mut wts2) = (w.v.ptr, w.v2.ptr);
     {
@@ -577,7 +739,7 @@ fn try_prove_min<Ch: Challenger>(
         return None;
     }
     let t1 = Instant::now();
-    let out = transcript(&mut g, &mut st, &k, k_log, fresh, incoming, gate, channel);
+    let out = transcript(&mut g, &mut st, &k, k_log, k_skip, fresh, incoming, gate, channel);
     free_work(&g, &mut st.work);
     g.fold = Some(st);
     match out {
@@ -716,34 +878,26 @@ fn try_fold_alpha_quirky_min(
     }
 }
 
-/// Idle trim: keep only the smallest cached matrix (the common 2^23 one) and no work tables.
+/// Idle trim frees device copies and keeps the host tables, so the next proof uploads instead of
+/// decoding the matrix again.
 fn trim_state(st: &mut Box<dyn std::any::Any + Send>) {
     if let Some(s) = st.downcast_mut::<State>() {
-        if let Some(min) = s.matrices.iter().map(|m| m.width).min() {
-            s.matrices.retain(|m| m.width == min);
+        for matrix in &mut s.matrices {
+            release_device_drop(matrix);
         }
         s.cur = 0;
     }
 }
 
-/// The cached matrix for this statement and width: one cached matrix per width (proofs alternate 2^23 and 2^24),
-/// a stale one of the same width is replaced, and on out-of-memory the other cached matrices are dropped and the
-/// upload tried once more. Dropped matrices free their device memory.
-fn matrix_slot(g: &Gpu, st: &mut State, r1cs: &CompactFieldR1cs, width: usize) -> Result<usize, String> {
+/// The cached matrix for this statement and width. Host tables are built once. A stale matrix of
+/// the same width is replaced. Device upload happens in `ensure_csr` / `ensure_csc`.
+fn matrix_slot(_g: &Gpu, st: &mut State, r1cs: &CompactFieldR1cs, width: usize) -> Result<usize, String> {
     let key = (r1cs.amun_statement_digest(), width);
     if let Some(i) = st.matrices.iter().position(|m| m.key == key) {
         return Ok(i);
     }
     st.matrices.retain(|m| m.width != width);
-    let m = match upload_matrix(g, r1cs, width) {
-        Ok(m) => m,
-        Err(e) if e.contains("CUresult 2)") && !st.matrices.is_empty() => {
-            st.matrices.clear();
-            upload_matrix(g, r1cs, width)?
-        }
-        Err(e) => return Err(e),
-    };
-    st.matrices.push(m);
+    st.matrices.push(build_host_matrix(r1cs, width)?);
     Ok(st.matrices.len() - 1)
 }
 
@@ -762,6 +916,9 @@ fn lincheck_once(
         let k = kernels(&g)?;
         let f = g.function(c"lincheck_fold_bal")?;
         let mi = matrix_slot(g, st, r1cs, width)?;
+        park_other_widths(g, st, width);
+        free_csr(g, &mut st.matrices[mi]);
+        ensure_csc(g, &mut st.matrices[mi])?;
         let m = &st.matrices[mi];
         let w = &mut st.work;
         let skip = lagrange_weights(k_skip, z_skip, 0);
