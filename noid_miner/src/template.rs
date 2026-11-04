@@ -455,17 +455,22 @@ impl TemplateBuilder {
                 .await;
             (entries, pending, None, None)
         };
-        let (entries, pending_outputs, v2_class) = if self.amun_skip_user_txs {
+        let (entries, pending_outputs, v2_class, v21_class) = if self.amun_skip_user_txs {
             grouped_intents.clear();
             trade_batches.clear();
             trade_authorizations.clear();
+            // The class was selected for the transactions just dropped. An
+            // empty block, including the development payout, fits in Small.
             (
                 Vec::new(),
                 Default::default(),
                 v2_class.map(|_| noid_recursive::acceptance::history_step::v2::banked::Class::Small),
+                v21_class.map(|_| {
+                    noid_recursive::acceptance::history_step::v2::capacity_banked::Class::Small
+                }),
             )
         } else {
-            (entries, pending_outputs, v2_class)
+            (entries, pending_outputs, v2_class, v21_class)
         };
         let has_versioned_class = v2_class.is_some() || v21_class.is_some();
         // Retain proof/opening pairs by logical id through group ordering and
