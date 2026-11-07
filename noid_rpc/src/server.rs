@@ -1565,6 +1565,8 @@ impl RpcHandler {
         let cancel = preparation.cancel_flag();
         let (prepared, prepare_elapsed) = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
+            // Stop the shared miner before this fold. Drop releases the turn.
+            let _turn = GpuTurn::acquire("noid");
             let result = noid_miner::install_history_step_phase_cpu(|| {
                 PreparedBlockAttempt::prepare_cancellable(tmpl, &runtime, &ghost, now, &cancel)
                     .and_then(|prepared| {
@@ -4888,5 +4890,65 @@ mod access_control_tests {
 
         handle.stop().unwrap();
         handle.stopped().await;
+    }
+}
+
+struct GpuTurn {
+    child: std::process::Child,
+}
+
+impl GpuTurn {
+    /// One turn on the shared GPU. The boss daemon stops the miner before `go`
+    /// and resumes it only when no proof is still holding a turn.
+    /// A missing daemon must not wedge the template: prove anyway after the wait.
+    fn acquire(name: &str) -> Option<Self> {
+        let mut child = match std::process::Command::new("/usr/bin/python3")
+            .arg("/home/boss/noid/gpu-turn.py")
+            .arg("hold")
+            .arg(name)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!(
+                    "amun gpu turn: {name} not granted ({error}), proving without the pause"
+                );
+                return None;
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("amun gpu turn: {name} not granted, proving without the pause");
+            return None;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line);
+            let _ = tx.send(line);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(65)) {
+            Ok(line) if line.starts_with("go") => {
+                eprintln!("amun gpu turn: {name} granted");
+                Some(Self { child })
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("amun gpu turn: {name} not granted, proving without the pause");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for GpuTurn {
+    fn drop(&mut self) {
+        // Closing stdin releases the turn. The daemon resumes the miner if no turn remains.
+        drop(self.child.stdin.take());
+        let _ = self.child.wait();
     }
 }
