@@ -952,12 +952,24 @@ fn manifest_round_gap_is_resolved(local_height: u64, highest_announced: u64) -> 
 }
 
 fn stale_gap_recovery_is_due(
-    stale_secs: u64,
     local_height: u64,
     highest_announced: u64,
     canonical_transition_active: bool,
 ) -> bool {
-    stale_secs >= 30 && highest_announced > local_height && !canonical_transition_active
+    highest_announced > local_height && !canonical_transition_active
+}
+
+fn stale_gap_retry_too_soon(
+    previous: Option<(libp2p::PeerId, u64, Instant)>,
+    peer: libp2p::PeerId,
+    height: u64,
+    now: Instant,
+) -> bool {
+    previous.is_some_and(|(prev_peer, prev_height, at)| {
+        prev_peer == peer
+            && prev_height == height
+            && now.saturating_duration_since(at) < Duration::from_secs(1)
+    })
 }
 
 fn terminal_transport_can_retry_same_peer(kind: noid_p2p::RequestFailureKind) -> bool {
@@ -7924,10 +7936,28 @@ mod tests {
 
     #[test]
     fn stale_gap_recovery_never_duplicates_an_active_canonical_transition() {
-        assert!(!stale_gap_recovery_is_due(29, 99, 100, false));
-        assert!(stale_gap_recovery_is_due(30, 99, 100, false));
-        assert!(!stale_gap_recovery_is_due(30, 99, 100, true));
-        assert!(!stale_gap_recovery_is_due(30, 100, 100, false));
+        assert!(stale_gap_recovery_is_due(99, 100, false));
+        assert!(!stale_gap_recovery_is_due(99, 100, true));
+        assert!(!stale_gap_recovery_is_due(100, 100, false));
+        assert!(!stale_gap_recovery_is_due(101, 100, false));
+    }
+
+    #[test]
+    fn stale_gap_retry_holds_the_same_peer_and_height_for_one_second() {
+        let peer = libp2p::PeerId::random();
+        let other = libp2p::PeerId::random();
+        let now = Instant::now();
+        let earlier = now.checked_sub(Duration::from_secs(1)).expect("instant");
+        assert!(!stale_gap_retry_too_soon(None, peer, 10, now));
+        assert!(stale_gap_retry_too_soon(Some((peer, 10, now)), peer, 10, now));
+        assert!(!stale_gap_retry_too_soon(Some((peer, 10, now)), other, 10, now));
+        assert!(!stale_gap_retry_too_soon(Some((peer, 10, now)), peer, 11, now));
+        assert!(!stale_gap_retry_too_soon(
+            Some((peer, 10, earlier)),
+            peer,
+            10,
+            now
+        ));
     }
 
     #[test]
@@ -9832,6 +9862,7 @@ async fn handle_p2p_events(
     // detects when our chain hasn't advanced despite seeing higher announcements
     // and re-requests from a random connected peer.
     let mut last_tip_advance: Instant = Instant::now();
+    let mut last_stale_gap_retry: Option<(libp2p::PeerId, u64, Instant)> = None;
     let mut highest_announced: u64 = 0;
     let mut last_announcement_peer: Option<libp2p::PeerId> = None;
     let mut bootstrap_complete_sent = false;
@@ -15392,78 +15423,85 @@ async fn handle_p2p_events(
             }
 
             // --- Stale-tip recovery ---
-            // If our chain hasn't advanced in 30s but we've seen higher announcements,
-            // re-request the missing blocks from the peer that announced highest.
-            // This handles the case where all initial block requests failed (peer
-            // didn't have the block yet, stream capacity hit, etc.) in large networks.
+            // A peer authenticated a block above our tip and the first fetch
+            // did not land. Retry on this heartbeat. The same peer and height
+            // wait one second so a failure is not repeated every 500 ms, and
+            // the dispatch does not reset the tip clock. The current job keeps
+            // running until a new template exists.
             let stale_secs = last_tip_advance.elapsed().as_secs();
-            if stale_secs >= 30 {
+            let canonical_transition_active = active_suffix_sync.is_some()
+                || exact_suffix_apply_inflight.is_some()
+                || snapshot_plan_active!();
+            if !canonical_transition_active {
                 let our_height = {
                     let ctx = chain.read().await;
                     ctx.tip_height()
                 };
-                let canonical_transition_active = active_suffix_sync.is_some()
-                    || exact_suffix_apply_inflight.is_some()
-                    || snapshot_plan_active!();
                 if stale_gap_recovery_is_due(
-                    stale_secs,
                     our_height,
                     highest_announced,
                     canonical_transition_active,
                 ) {
                     if let Some(peer) = last_announcement_peer {
-                        let gap = highest_announced - our_height;
-                        let mut recovery_dispatched = false;
-                        if sync_target_requires_snapshot(
+                        if !stale_gap_retry_too_soon(
+                            last_stale_gap_retry,
+                            peer,
                             our_height,
-                            highest_announced,
-                            post_snapshot_tail,
+                            Instant::now(),
                         ) {
-                            if pending_manifest.is_none()
-                                && pending_snapshot_header_sync.is_none()
-                                && snapshot_header_staging_inflight.is_none()
-                                && history_step_verification_inflight.is_none()
-                                && snapshot_staging_inflight.is_none()
-                                && snapshot_install_inflight.is_none()
-                                && active_snapshot_sync
-                                    .as_ref()
-                                    .is_none_or(|sync| sync.all_segments_verified())
-                            {
-                                if try_request_manifest!(peer, our_height, [0; 32]) {
-                                    recovery_dispatched = true;
-                                    manifest_force_snapshot_peers.insert(peer);
+                            let gap = highest_announced - our_height;
+                            let mut recovery_dispatched = false;
+                            if sync_target_requires_snapshot(
+                                our_height,
+                                highest_announced,
+                                post_snapshot_tail,
+                            ) {
+                                if pending_manifest.is_none()
+                                    && pending_snapshot_header_sync.is_none()
+                                    && snapshot_header_staging_inflight.is_none()
+                                    && history_step_verification_inflight.is_none()
+                                    && snapshot_staging_inflight.is_none()
+                                    && snapshot_install_inflight.is_none()
+                                    && active_snapshot_sync
+                                        .as_ref()
+                                        .is_none_or(|sync| sync.all_segments_verified())
+                                {
+                                    if try_request_manifest!(peer, our_height, [0; 32]) {
+                                        recovery_dispatched = true;
+                                        manifest_force_snapshot_peers.insert(peer);
+                                        tracing::info!(
+                                            our_height,
+                                            highest_announced,
+                                            stale_secs,
+                                            peer = %peer,
+                                            "stale deep gap — requesting snapshot manifest"
+                                        );
+                                    }
+                                }
+                            } else {
+                                let count = (gap + 1).min(DIRECT_SYNC_HEADER_REQUEST_CAP) as u16;
+                                recovery_dispatched = try_dispatch_header_fetch(
+                                    &p2p_cmd,
+                                    &mut fetch_in_progress,
+                                    &mut recent_header_fetches,
+                                    peer,
+                                    our_height,
+                                    count,
+                                    Instant::now(),
+                                );
+                                if recovery_dispatched {
                                     tracing::info!(
                                         our_height,
                                         highest_announced,
                                         stale_secs,
                                         peer = %peer,
-                                        "stale deep gap — requesting snapshot manifest"
+                                        "stale recent gap — re-requesting authenticated headers"
                                     );
                                 }
                             }
-                        } else {
-                            let count = (gap + 1).min(DIRECT_SYNC_HEADER_REQUEST_CAP) as u16;
-                            recovery_dispatched = try_dispatch_header_fetch(
-                                &p2p_cmd,
-                                &mut fetch_in_progress,
-                                &mut recent_header_fetches,
-                                peer,
-                                our_height,
-                                count,
-                                Instant::now(),
-                            );
                             if recovery_dispatched {
-                                tracing::info!(
-                                    our_height,
-                                    highest_announced,
-                                    stale_secs,
-                                    peer = %peer,
-                                    "stale recent gap — re-requesting authenticated headers"
-                                );
+                                last_stale_gap_retry = Some((peer, our_height, Instant::now()));
                             }
-                        }
-                        if recovery_dispatched {
-                            last_tip_advance = Instant::now();
                         }
                     }
                 }
