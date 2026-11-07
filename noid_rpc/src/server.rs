@@ -4903,7 +4903,7 @@ impl GpuTurn {
     /// A missing daemon must not wedge the template: prove anyway after the wait.
     fn acquire(name: &str) -> Option<Self> {
         let mut child = match std::process::Command::new("/usr/bin/python3")
-            .arg("/home/boss/noid/gpu-turn.py")
+            .arg("/usr/local/bin/gpu-turn.py")
             .arg("hold")
             .arg(name)
             .stdin(std::process::Stdio::piped())
