@@ -36,6 +36,9 @@ pub(crate) struct Api {
     sync: unsafe extern "C" fn() -> CuResult,
     get_function: unsafe extern "C" fn(*mut CuFunction, CuModule, *const c_char) -> CuResult,
     mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuResult,
+    primary_reset: unsafe extern "C" fn(CuDevice) -> CuResult,
+    primary_retain: unsafe extern "C" fn(*mut CuCtx, CuDevice) -> CuResult,
+    module_load: unsafe extern "C" fn(*mut CuModule, *const c_void) -> CuResult,
 }
 
 /// Grow-only device buffer. Dropping it frees the device memory (drops happen under the GPU lock, where the
@@ -47,20 +50,24 @@ pub(crate) struct DBuf {
 }
 
 static MEM_FREE: OnceLock<unsafe extern "C" fn(DevPtr) -> CuResult> = OnceLock::new();
+/// Set while dropping device buffers whose context is already dead, so `cuMemFree` is not called.
+static ABANDON: AtomicBool = AtomicBool::new(false);
 
 impl Drop for DBuf {
     fn drop(&mut self) {
-        if self.ptr != 0 {
+        if self.ptr != 0 && !ABANDON.load(Ordering::Relaxed) {
             if let Some(f) = MEM_FREE.get() {
                 unsafe { f(self.ptr) };
             }
-            self.ptr = 0;
         }
+        self.ptr = 0;
+        self.cap = 0;
     }
 }
 
 pub(crate) struct Gpu {
     api: Api,
+    dev: CuDevice,
     ctx: CuCtx,
     module: CuModule,
     pub name: String,
@@ -120,6 +127,9 @@ fn init() -> Result<Gpu, String> {
             sync: sym(lib, c"cuCtxSynchronize")?,
             get_function: sym(lib, c"cuModuleGetFunction")?,
             mem_get_info: sym(lib, c"cuMemGetInfo_v2")?,
+            primary_reset: sym(lib, c"cuDevicePrimaryCtxReset_v2")?,
+            primary_retain: sym(lib, c"cuDevicePrimaryCtxRetain")?,
+            module_load: sym(lib, c"cuModuleLoadData")?,
         };
         let _ = MEM_FREE.set(api.mem_free);
         check(cu_init(0), "cuInit")?;
@@ -134,7 +144,7 @@ fn init() -> Result<Gpu, String> {
         check(module_load(&mut module, FATBIN.as_ptr().cast()), "cuModuleLoadData")?;
         let name = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
         eprintln!("amun gpu: enabled on {name}");
-        Ok(Gpu { api, ctx, module, name, merkle: Vec::new(), fold: None, walk: None, rel: None, fold_trim: None })
+        Ok(Gpu { api, dev, ctx, module, name, merkle: Vec::new(), fold: None, walk: None, rel: None, fold_trim: None })
     }
 }
 
@@ -288,6 +298,19 @@ impl Breaker {
     }
 }
 
+/// Illegal address (700) or a failed launch (719). The context is dead until it is reset.
+/// Out of memory (2) is not one of these.
+pub(crate) fn context_fault(err: &str) -> bool {
+    err.contains("CUresult 700)") || err.contains("CUresult 719)")
+}
+
+/// Drop device-owning state without `cuMemFree`. The context that allocated it is dead.
+pub(crate) fn abandon_drop<T>(value: T) {
+    ABANDON.store(true, Ordering::Relaxed);
+    drop(value);
+    ABANDON.store(false, Ordering::Relaxed);
+}
+
 impl Gpu {
     pub fn function(&self, name: &CStr) -> Result<CuFunction, String> {
         let mut f: CuFunction = std::ptr::null_mut();
@@ -365,6 +388,31 @@ impl Gpu {
             },
             "cuLaunchKernel",
         )
+    }
+
+    /// Drop cached device buffers and rebuild the primary context and module.
+    /// The call that faulted still uses the CPU. The next call tries the GPU again.
+    pub(crate) fn rebuild_after_fault(&mut self) -> Result<(), String> {
+        ABANDON.store(true, Ordering::Relaxed);
+        self.merkle.clear();
+        self.walk = None;
+        self.rel = None;
+        self.fold = None;
+        ABANDON.store(false, Ordering::Relaxed);
+        unsafe {
+            // Reset returns PRIMARY_CONTEXT_ACTIVE while this context is current.
+            let _ = (self.api.ctx_set_current)(std::ptr::null_mut());
+            check((self.api.primary_reset)(self.dev), "cuDevicePrimaryCtxReset")?;
+            let mut ctx: CuCtx = std::ptr::null_mut();
+            check((self.api.primary_retain)(&mut ctx, self.dev), "cuDevicePrimaryCtxRetain")?;
+            check((self.api.ctx_set_current)(ctx), "cuCtxSetCurrent")?;
+            let mut module: CuModule = std::ptr::null_mut();
+            check((self.api.module_load)(&mut module, FATBIN.as_ptr().cast()), "cuModuleLoadData")?;
+            self.ctx = ctx;
+            self.module = module;
+        }
+        eprintln!("amun gpu: context reset after an illegal address, GPU path stays on");
+        Ok(())
     }
 
     /// Launch `f` on `grid` blocks of `block` threads. `args` holds a pointer to each kernel argument.

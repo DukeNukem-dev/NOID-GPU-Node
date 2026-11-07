@@ -485,14 +485,24 @@ pub(super) fn try_prove<C: Challenger>(
     let k = match kernels(&g) {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("amun gpu walk: disabled ({e})");
-            BREAKER.trip();
-            g.walk = Some(st);
+            if gpu::context_fault(&e) {
+                gpu::abandon_drop(st);
+                let _ = g.rebuild_after_fault();
+                eprintln!("amun gpu walk: context fault, this walk on the CPU ({e})");
+            } else {
+                eprintln!("amun gpu walk: disabled ({e})");
+                BREAKER.trip();
+                g.walk = Some(st);
+            }
             return None;
         }
     };
     if let Err(e) = prepare(&mut g, &mut st, &k, base_states) {
-        if e.contains("CUresult 2)") {
+        if gpu::context_fault(&e) {
+            gpu::abandon_drop(st);
+            let _ = g.rebuild_after_fault();
+            eprintln!("amun gpu walk: context fault, this walk on the CPU ({e})");
+        } else if e.contains("CUresult 2)") {
             drop(st);   // frees its device buffers
             eprintln!("amun gpu walk: out of GPU memory, this walk on the CPU");
         } else {

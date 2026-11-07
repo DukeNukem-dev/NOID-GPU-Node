@@ -157,6 +157,12 @@ pub(super) fn try_prove<C: Challenger>(
     let k = match setup {
         Ok(k) => k,
         Err(e) => {
+            if gpu::context_fault(&e) {
+                gpu::abandon_drop(st);
+                let _ = g.rebuild_after_fault();
+                eprintln!("amun gpu relation: context fault, this relation on the CPU ({e})");
+                return None;
+            }
             // Out of GPU memory is not fatal: this relation runs on the CPU, later ones try again.
             g.free(&mut st.arena);
             if !e.contains("CUresult 2)") {
@@ -339,6 +345,12 @@ pub(super) fn try_prove_shift<C: Challenger>(
     let p = match setup {
         Ok(p) => p,
         Err(e) => {
+            if gpu::context_fault(&e) {
+                gpu::abandon_drop(st);
+                let _ = g.rebuild_after_fault();
+                eprintln!("amun gpu shift: context fault, this relation on the CPU ({e})");
+                return None;
+            }
             g.free(&mut st.arena);
             if !e.contains("CUresult 2)") {
                 eprintln!("amun gpu shift: setup error, using CPU from now on ({e})");

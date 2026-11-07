@@ -711,9 +711,15 @@ fn try_prove_min<Ch: Challenger>(
     let k = match kernels(&g) {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("amun gpu fold: disabled ({e})");
-            BREAKER.trip();
-            g.fold = Some(st);
+            if gpu::context_fault(&e) {
+                gpu::abandon_drop(st);
+                let _ = g.rebuild_after_fault();
+                eprintln!("amun gpu fold: context fault, this fold on the CPU ({e})");
+            } else {
+                eprintln!("amun gpu fold: disabled ({e})");
+                BREAKER.trip();
+                g.fold = Some(st);
+            }
             return None;
         }
     };
@@ -726,6 +732,12 @@ fn try_prove_min<Ch: Challenger>(
         res = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming);
     }
     if let Err(e) = res {
+        if gpu::context_fault(&e) {
+            gpu::abandon_drop(st);
+            let _ = g.rebuild_after_fault();
+            eprintln!("amun gpu fold: context fault, this fold on the CPU ({e})");
+            return None;
+        }
         free_work(&g, &mut st.work);
         // Out of GPU memory is not fatal: this fold runs on the CPU, the next one tries again.
         if !e.contains("CUresult 2)") {
@@ -861,6 +873,14 @@ fn try_fold_alpha_quirky_min(
         g.evict_others();
         st.matrices.retain(|m| m.width == width);
         result = lincheck_once(&g, &mut st, r1cs, alpha, z_skip, x_inner_rest, k_skip, width, k_log);
+    }
+    if let Err(e) = &result {
+        if gpu::context_fault(e) {
+            gpu::abandon_drop(st);
+            let _ = g.rebuild_after_fault();
+            eprintln!("amun gpu lincheck: context fault, this fold on the CPU ({e})");
+            return None;
+        }
     }
     free_work(&g, &mut st.work);
     g.fold = Some(st);

@@ -5,7 +5,7 @@
 //! straight from the device codeword, and the codeword is copied into the caller's (pre-faulted) host buffer
 //! for the later PCS steps. Checks before returning: one full codeword lane is recomputed on the CPU (in
 //! parallel with the GPU work) and compared at 64 random positions, and the tree gets the leaf/parent spot check.
-//! Any error or mismatch falls back to the CPU commit and disables this path. `NOID_GPU_COMMIT=0` disables it.
+//! A context fault resets the GPU and the next commit tries again. Any other error or mismatch falls back to the CPU commit and disables this path. `NOID_GPU_COMMIT=0` disables it.
 
 use super::{Commitment, PcsParams, ProverData};
 use crate::field::F128;
@@ -98,6 +98,14 @@ pub(super) fn try_commit(z_packed: &[F128], mut codeword: Vec<F128>, params: &Pc
         (run, helper.join().expect("reference column thread"))
     });
     g.merkle = bufs;
+    if let Err(e) = &run {
+        if gpu::context_fault(e) {
+            let _ = g.rebuild_after_fault();
+            eprintln!("amun gpu commit: context fault, this commit on the CPU ({e})");
+            drop(g);
+            return Err(codeword);
+        }
+    }
     drop(g);
     if let Err(e) = run {
         if e.contains("CUresult 2)") {
