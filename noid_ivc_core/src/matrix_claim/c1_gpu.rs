@@ -105,6 +105,9 @@ struct State {
     /// Index of the matrix the current fold uses.
     cur: usize,
     work: Work,
+    /// One retry after a kept small matrix ran out of device memory.
+    /// The second prepare or lincheck frees it and ping-pongs once.
+    drop_kept: bool,
 }
 
 const F: usize = std::mem::size_of::<F256>();
@@ -296,6 +299,13 @@ fn free_csc(g: &Gpu, m: &mut Matrix) {
     g.free(&mut m.csc_ci);
 }
 
+/// Row and column sides of this width stay on the device between proofs.
+/// 2^24 is about 2 GB on the column side and still ping-pongs: both sides
+/// plus the work tables do not fit beside the other process on this card.
+fn keep_device_matrix(width: usize) -> bool {
+    width <= 1 << 23
+}
+
 fn ensure_csr(g: &Gpu, m: &mut Matrix) -> Result<(), String> {
     if m.rp[0].ptr != 0 {
         return Ok(());
@@ -403,10 +413,18 @@ fn prepare(
     incoming: &C1MatrixAccClaim,
 ) -> Result<(), String> {
     let width = 1usize << k_log;
+    let drop_kept = std::mem::replace(&mut st.drop_kept, false);
     st.cur = matrix_slot(g, st, r1cs, width)?;
     park_other_widths(g, st, width);
     let idx = st.cur;
-    free_csc(g, &mut st.matrices[idx]);
+    // Freeing a resident small matrix here is the upload on every proof.
+    // drop_kept is the single retry after that keep ran out of memory.
+    if drop_kept || !keep_device_matrix(width) {
+        free_csc(g, &mut st.matrices[idx]);
+        if drop_kept {
+            free_csr(g, &mut st.matrices[idx]);
+        }
+    }
     ensure_csr(g, &mut st.matrices[idx])?;
     let rest_len = width >> k_skip;
     let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
@@ -440,7 +458,9 @@ fn prepare(
         g.free(&mut w.v);
         g.free(&mut w.e);
     }
-    free_csr(g, &mut st.matrices[idx]);
+    if drop_kept || !keep_device_matrix(width) {
+        free_csr(g, &mut st.matrices[idx]);
+    }
 
     let w = &mut st.work;
     let lambda = lagrange_weights(k_skip, fresh.z_skip, 0);
@@ -706,7 +726,7 @@ fn try_prove_min<Ch: Challenger>(
     let t0 = Instant::now();
     let mut st: Box<State> = match g.fold.take().and_then(|b| b.downcast::<State>().ok()) {
         Some(s) => s,
-        None => Box::new(State { matrices: Vec::new(), cur: 0, work: Work::default() }),
+        None => Box::new(State { matrices: Vec::new(), cur: 0, work: Work::default(), drop_kept: false }),
     };
     let k = match kernels(&g) {
         Ok(k) => k,
@@ -725,10 +745,16 @@ fn try_prove_min<Ch: Challenger>(
     };
     let mut res = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming);
     if res.as_ref().is_err_and(|e| e.contains("CUresult 2)")) {
-        // Out of memory: free the other GPU users' caches and the other matrix, then try once more.
+        // Out of memory: free the other GPU users' caches, the other matrix,
+        // and a small matrix this fold tried to keep. The retry ping-pongs.
         free_work(&g, &mut st.work);
         g.evict_others();
         st.matrices.retain(|m| m.width == 1usize << k_log);
+        st.drop_kept = true;
+        if let Some(m) = st.matrices.first_mut() {
+            free_csc(&g, m);
+            free_csr(&g, m);
+        }
         res = prepare(&mut g, &mut st, &k, r1cs, k_log, k_skip, fresh, incoming);
     }
     if let Err(e) = res {
@@ -864,14 +890,20 @@ fn try_fold_alpha_quirky_min(
     g.fold_trim = Some(trim_state);
     let mut st: Box<State> = match g.fold.take().and_then(|b| b.downcast::<State>().ok()) {
         Some(s) => s,
-        None => Box::new(State { matrices: Vec::new(), cur: 0, work: Work::default() }),
+        None => Box::new(State { matrices: Vec::new(), cur: 0, work: Work::default(), drop_kept: false }),
     };
     let mut result = lincheck_once(&g, &mut st, r1cs, alpha, z_skip, x_inner_rest, k_skip, width, k_log);
     if result.as_ref().is_err_and(|e| e.contains("CUresult 2)")) {
-        // Out of memory: free the other GPU users' caches and the other matrix, then try once more.
+        // Out of memory: free the other GPU users' caches, the other matrix,
+        // and a small matrix this lincheck tried to keep. The retry ping-pongs.
         free_work(&g, &mut st.work);
         g.evict_others();
         st.matrices.retain(|m| m.width == width);
+        st.drop_kept = true;
+        if let Some(m) = st.matrices.first_mut() {
+            free_csr(&g, m);
+            free_csc(&g, m);
+        }
         result = lincheck_once(&g, &mut st, r1cs, alpha, z_skip, x_inner_rest, k_skip, width, k_log);
     }
     if let Err(e) = &result {
@@ -898,12 +930,15 @@ fn try_fold_alpha_quirky_min(
     }
 }
 
-/// Idle trim frees device copies and keeps the host tables, so the next proof uploads instead of
-/// decoding the matrix again.
+/// Idle trim drops a matrix wider than 2^23 and keeps every host table, so the
+/// next wide proof uploads instead of decoding again. A 2^23 matrix stays on
+/// the device: proofs are minutes apart, and trimming it would re-upload both sides.
 fn trim_state(st: &mut Box<dyn std::any::Any + Send>) {
     if let Some(s) = st.downcast_mut::<State>() {
         for matrix in &mut s.matrices {
-            release_device_drop(matrix);
+            if !keep_device_matrix(matrix.width) {
+                release_device_drop(matrix);
+            }
         }
         s.cur = 0;
     }
@@ -937,7 +972,15 @@ fn lincheck_once(
         let f = g.function(c"lincheck_fold_bal")?;
         let mi = matrix_slot(g, st, r1cs, width)?;
         park_other_widths(g, st, width);
-        free_csr(g, &mut st.matrices[mi]);
+        let drop_kept = std::mem::replace(&mut st.drop_kept, false);
+        // Lincheck reads the column side. A kept small row side stays unless
+        // this is the wide matrix or the one retry after it ran out of memory.
+        if drop_kept || !keep_device_matrix(width) {
+            free_csr(g, &mut st.matrices[mi]);
+        }
+        if drop_kept {
+            free_csc(g, &mut st.matrices[mi]);
+        }
         ensure_csc(g, &mut st.matrices[mi])?;
         let m = &st.matrices[mi];
         let w = &mut st.work;

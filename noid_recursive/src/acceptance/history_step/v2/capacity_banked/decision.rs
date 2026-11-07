@@ -111,7 +111,7 @@ pub fn verify_terminal(
         .accumulator
         .validate_local_header_boundary(header, epoch_header)
         .map_err(|_| V2Error::Boundary)?;
-    let (fresh, _) = parent::replay(runtime, terminal.class, &terminal.proof)?;
+    let (fresh, scratch) = parent::replay(runtime, terminal.class, &terminal.proof)?;
     for class in Class::ALL {
         let current_fresh = (class == terminal.class).then_some(&fresh);
         let accumulated = parsed.claims[class.index()].as_ref();
@@ -131,6 +131,10 @@ pub fn verify_terminal(
             runtime.cache.remember(&runtime.bank, class, claim.clone());
         }
     }
+    // Admission already paid for this replay. The next proof's prepare_parent
+    // hits the slot when this terminal is its parent. Dropping the scratch
+    // here made every live proof miss.
+    parent::remember_replay(runtime, terminal, &fresh, &scratch);
     Ok(AcceptedTerminal {
         class: parsed.class,
         accumulator: parsed.accumulator,
