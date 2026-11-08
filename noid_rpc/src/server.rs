@@ -4893,6 +4893,8 @@ mod access_control_tests {
     }
 }
 
+const GPU_TURN_HELPER: &str = "/usr/local/bin/gpu-turn.py";
+
 struct GpuTurn {
     child: std::process::Child,
 }
@@ -4902,8 +4904,14 @@ impl GpuTurn {
     /// and resumes it only when no proof is still holding a turn.
     /// A missing daemon must not wedge the template: prove anyway after the wait.
     fn acquire(name: &str) -> Option<Self> {
+        // CPU-only proving (NOID_GPU=0) or no turn daemon on this host: nothing to share.
+        if std::env::var("NOID_GPU").is_ok_and(|v| v == "0")
+            || !std::path::Path::new(GPU_TURN_HELPER).exists()
+        {
+            return None;
+        }
         let mut child = match std::process::Command::new("/usr/bin/python3")
-            .arg("/usr/local/bin/gpu-turn.py")
+            .arg(GPU_TURN_HELPER)
             .arg("hold")
             .arg(name)
             .stdin(std::process::Stdio::piped())
